@@ -5,6 +5,10 @@ RUN npm ci
 COPY frontend/ ./
 RUN npm run build
 
-FROM caddy:2.10.2-alpine
+FROM caddy:2.11.4-alpine
+RUN apk upgrade --no-cache \
+    && addgroup -S caddy \
+    && adduser -S -D -H -G caddy caddy
 COPY infra/Caddyfile /etc/caddy/Caddyfile
 COPY --from=frontend-builder /build/dist /srv
+USER caddy
