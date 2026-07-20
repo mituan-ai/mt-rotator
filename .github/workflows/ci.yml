@@ -86,14 +86,14 @@ jobs:
       - name: Build web image
         run: docker build --file infra/Caddy.Dockerfile --tag mt-rotator-web:ci .
       - name: Scan backend image
-        uses: aquasecurity/trivy-action@0.33.1
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: mt-rotator-api:ci
           severity: CRITICAL,HIGH
           ignore-unfixed: true
           exit-code: "1"
       - name: Scan web image
-        uses: aquasecurity/trivy-action@0.33.1
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: mt-rotator-web:ci
           severity: CRITICAL,HIGH
