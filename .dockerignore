@@ -1,0 +1,13 @@
+.git
+.github
+.env
+backend
+backups
+frontend/dist
+frontend/node_modules
+frontend/playwright-report
+frontend/test-results
+**/__pycache__
+**/.pytest_cache
+**/.ruff_cache
+**/.mypy_cache

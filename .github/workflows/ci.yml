@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.10.8"
+          enable-cache: true
+          cache-dependency-glob: backend/uv.lock
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install backend dependencies
+        run: uv sync --frozen --all-groups
+        working-directory: backend
+      - name: Lint and format check
+        run: uv run ruff check . && uv run ruff format --check .
+        working-directory: backend
+      - name: Type check
+        run: MT_TESTING=1 uv run mypy apps mt_rotator
+        working-directory: backend
+      - name: Django checks and migration drift
+        run: |
+          MT_TESTING=1 uv run python manage.py check
+          MT_TESTING=1 uv run python manage.py makemigrations --check --dry-run
+        working-directory: backend
+      - name: Tests
+        run: MT_TESTING=1 uv run pytest --cov=apps --cov-report=term-missing
+        working-directory: backend
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.18.0"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install frontend dependencies
+        run: npm ci
+        working-directory: frontend
+      - name: Type check and unit tests
+        run: npm run typecheck && npm test
+        working-directory: frontend
+      - name: Production build
+        run: npm run build
+        working-directory: frontend
+
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.18.0"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+        working-directory: frontend
+      - run: npx playwright install --with-deps chromium
+        working-directory: frontend
+      - run: npm run e2e
+        working-directory: frontend
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Validate Compose configuration
+        run: cp .env.example .env && docker compose config --quiet
+      - name: Build backend image
+        run: docker build --tag mt-rotator-api:ci backend
+      - name: Build web image
+        run: docker build --file infra/Caddy.Dockerfile --tag mt-rotator-web:ci .
+      - name: Scan backend image
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          image-ref: mt-rotator-api:ci
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+      - name: Scan web image
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          image-ref: mt-rotator-web:ci
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"

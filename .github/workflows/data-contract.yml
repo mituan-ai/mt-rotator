@@ -1,0 +1,28 @@
+name: Free data contract
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "30 13 * * 1-5"
+
+permissions:
+  contents: read
+
+jobs:
+  live-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.10.8"
+          enable-cache: true
+          cache-dependency-glob: backend/uv.lock
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync --frozen --all-groups
+        working-directory: backend
+      - name: Probe AKShare Eastmoney and Sina contracts
+        run: MT_TESTING=1 uv run pytest -o addopts="-q --strict-markers" -m live
+        working-directory: backend
