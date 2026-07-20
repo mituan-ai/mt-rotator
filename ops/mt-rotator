@@ -154,7 +154,9 @@ restore_verify() {
     restic restore latest --tag mt-rotator-postgres --target "$restore_root"
     dump_path=$(find "$restore_root" -type f -name database.dump -print -quit)
     counts_path=$(find "$restore_root" -type f -name counts.txt -print -quit)
-    [ -n "$dump_path" ] && [ -n "$counts_path" ] || die "latest backup is incomplete"
+    if [ -z "$dump_path" ] || [ -z "$counts_path" ]; then
+        die "latest backup is incomplete"
+    fi
     docker compose exec -T postgres createdb --username "$POSTGRES_USER" "$verify_db"
     docker compose exec -T postgres pg_restore \
         --username "$POSTGRES_USER" \
@@ -227,7 +229,9 @@ rollback_release() {
     require_command docker
     lock_deployment
     load_state || die "no deployment state found"
-    [ -n "${PREVIOUS_API_IMAGE:-}" ] && [ -n "${PREVIOUS_WEB_IMAGE:-}" ] || die "no previous release found"
+    if [ -z "${PREVIOUS_API_IMAGE:-}" ] || [ -z "${PREVIOUS_WEB_IMAGE:-}" ]; then
+        die "no previous release found"
+    fi
     backup_remote
     current_version=$CURRENT_VERSION
     current_api=$CURRENT_API_IMAGE
