@@ -26,6 +26,10 @@ docker compose exec api python manage.py create_admin --email admin@example.com 
 
 ## 更新与回退
 
+生产发布由 GitHub Tag 触发。`production` Environment 保存服务器地址、部署用户、专用 SSH 私钥和已核验的主机公钥；CI 的短期令牌只通过 SSH 标准输入传给 `docker login`，部署结束后立即执行 `docker logout`，服务器不长期保存 GHCR 凭据。
+
+GitHub 工作流最终仍只调用下面的统一运维入口，手工故障处理也使用相同命令：
+
 ```bash
 ./ops/mt-rotator update v1.1.0
 ./ops/mt-rotator status

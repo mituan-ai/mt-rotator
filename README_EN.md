@@ -264,26 +264,33 @@ Run one manual verification:
 ./ops/mt-rotator restore-verify
 ```
 
-### Updating after a release
+### Automatic updates after a release
 
-The repository supports immutable release images and a single server-side update command, but publishing to GitHub does not currently open an SSH session to Tencent Cloud automatically. After publishing a new tag, run on the server:
+Configure these secrets in the GitHub `production` Environment:
 
-```bash
-cd /opt/mt-rotator
-git fetch --tags
-git checkout v1.1.0
-./ops/mt-rotator update v1.1.0
+```text
+PRODUCTION_HOST
+PRODUCTION_USER
+PRODUCTION_SSH_PRIVATE_KEY
+PRODUCTION_KNOWN_HOSTS
 ```
 
-The update acquires a deployment lock, creates an off-server backup, pulls the images, applies migrations, and waits for health checks. A failed update restores the previous application images. It does not delete the PostgreSQL volume or reverse database migrations automatically.
+`PRODUCTION_SSH_PRIVATE_KEY` must be a dedicated deployment key whose public key is present in the deployment user's `authorized_keys`. `PRODUCTION_KNOWN_HOSTS` must contain the manually verified SSH host key; the workflow does not trust a freshly scanned host key.
+
+After a semantic version tag is pushed, CI runs the tests, builds and scans both images, publishes immutable release images, and updates the server automatically:
+
+```bash
+git tag v1.1.0
+git push origin v1.1.0
+```
+
+The deployment job uses its short-lived GitHub token to pull GHCR images and logs out from the registry afterward. The server still runs `./ops/mt-rotator update`, which acquires a deployment lock, creates an off-server backup, pins image digests, applies migrations, and waits for health checks. A failed update restores the previous application images. It does not delete the PostgreSQL volume or reverse database migrations automatically.
 
 To roll back application images:
 
 ```bash
 ./ops/mt-rotator rollback
 ```
-
-Automatic Tencent Cloud deployment after a GitHub tag requires a GitHub `production` Environment containing the server address, SSH user, SSH private key, and host fingerprint, plus a deployment job that runs the server update command after image publication. That remote deployment job is not enabled in the current repository.
 
 See [docs/operations.md](docs/operations.md) for backup, recovery, and incident procedures, and [docs/architecture.md](docs/architecture.md) for domain boundaries.
 

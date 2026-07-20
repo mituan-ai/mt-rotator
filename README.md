@@ -264,26 +264,33 @@ sudo systemctl enable --now \
 ./ops/mt-rotator restore-verify
 ```
 
-### 发布后更新
+### 发布后自动更新
 
-当前仓库支持固定版本镜像和服务器一键更新，但不会在 GitHub 发布后自动 SSH 登录腾讯云。发布新 Tag 后，在服务器执行：
+GitHub `production` Environment 需要配置以下 Secrets：
 
-```bash
-cd /opt/mt-rotator
-git fetch --tags
-git checkout v1.1.0
-./ops/mt-rotator update v1.1.0
+```text
+PRODUCTION_HOST
+PRODUCTION_USER
+PRODUCTION_SSH_PRIVATE_KEY
+PRODUCTION_KNOWN_HOSTS
 ```
 
-更新流程会加部署锁、执行远端备份、拉取镜像、运行数据库迁移并等待健康检查。失败时自动恢复上一组应用镜像；它不会删除 PostgreSQL 卷，也不会自动反向迁移数据库。
+`PRODUCTION_SSH_PRIVATE_KEY` 应使用仅供部署的 SSH 私钥，对应公钥写入服务器部署用户的 `authorized_keys`。`PRODUCTION_KNOWN_HOSTS` 保存经过人工核对的服务器 SSH 主机公钥，不能在工作流中临时信任扫描结果。
+
+推送语义化版本 Tag 后，CI 会先完成测试、构建和漏洞扫描，再发布固定版本镜像并自动更新服务器：
+
+```bash
+git tag v1.1.0
+git push origin v1.1.0
+```
+
+部署 Job 使用短期 GitHub 令牌拉取 GHCR 镜像，完成后立即退出镜像仓库。服务器仍由 `./ops/mt-rotator update` 执行部署锁、远端备份、镜像摘要固定、数据库迁移和健康检查。失败时自动恢复上一组应用镜像；它不会删除 PostgreSQL 卷，也不会自动反向迁移数据库。
 
 应用镜像回退：
 
 ```bash
 ./ops/mt-rotator rollback
 ```
-
-要实现 GitHub 发布 Tag 后自动更新腾讯云，还需要为 GitHub `production` Environment 配置服务器地址、SSH 用户、SSH 私钥和主机指纹，并增加一个在镜像发布成功后执行服务器更新命令的部署 Job。这项远程自动部署目前尚未启用。
 
 完整备份、恢复和故障处理说明见 [docs/operations.md](docs/operations.md)，领域边界见 [docs/architecture.md](docs/architecture.md)。
 
