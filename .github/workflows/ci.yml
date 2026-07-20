@@ -77,7 +77,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "22.18.0"
           cache: npm
@@ -96,7 +96,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "22.18.0"
           cache: npm
@@ -148,7 +148,7 @@ jobs:
           docker compose exec -T api python manage.py shell -c
           "from apps.accounts.models import User;
           User.objects.create_superuser(email='admin@example.com', display_name='管理员', password='Correct-Horse-Battery-Staple-2026')"
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "22.18.0"
           cache: npm
