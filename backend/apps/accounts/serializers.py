@@ -48,6 +48,12 @@ class RegisterSerializer(serializers.Serializer):
     def validate_email(self, value: str) -> str:
         return normalize_email_address(value)
 
+    def validate_display_name(self, value: str) -> str:
+        normalized = value.strip()
+        if User.objects.filter(display_name__iexact=normalized).exists():
+            raise serializers.ValidationError("该显示名称已被使用")
+        return normalized
+
     def validate_password(self, value: str) -> str:
         validate_password(value)
         return value

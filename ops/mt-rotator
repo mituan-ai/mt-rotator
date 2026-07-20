@@ -1,0 +1,268 @@
+#!/bin/sh
+set -eu
+
+project_dir=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+state_dir="$project_dir/.state"
+state_file="$state_dir/deploy.env"
+compose_base="$project_dir/compose.yaml"
+compose_prod="$project_dir/compose.prod.yaml"
+api_repository=${MT_API_REPOSITORY:-ghcr.io/mituan-ai/mt-rotator-api}
+web_repository=${MT_WEB_REPOSITORY:-ghcr.io/mituan-ai/mt-rotator-web}
+CURRENT_VERSION=""
+CURRENT_API_IMAGE=""
+CURRENT_WEB_IMAGE=""
+PREVIOUS_VERSION=""
+PREVIOUS_API_IMAGE=""
+PREVIOUS_WEB_IMAGE=""
+
+cd "$project_dir"
+
+die() {
+    echo "mt-rotator: $*" >&2
+    exit 1
+}
+
+require_command() {
+    command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+load_application_environment() {
+    [ -f "$project_dir/.env" ] || die ".env is required"
+    set -a
+    # shellcheck disable=SC1091
+    . "$project_dir/.env"
+    set +a
+    : "${POSTGRES_DB:?POSTGRES_DB must be configured}"
+    : "${POSTGRES_USER:?POSTGRES_USER must be configured}"
+}
+
+compose() {
+    docker compose -f "$compose_base" -f "$compose_prod" "$@"
+}
+
+load_backup_environment() {
+    backup_env=${MT_BACKUP_ENV:-/etc/mt-rotator/backup.env}
+    if [ -f "$backup_env" ]; then
+        # shellcheck disable=SC1090
+        . "$backup_env"
+    fi
+    : "${RESTIC_REPOSITORY:?RESTIC_REPOSITORY must be configured}"
+    if [ -z "${RESTIC_PASSWORD:-}" ] && [ -z "${RESTIC_PASSWORD_FILE:-}" ]; then
+        die "RESTIC_PASSWORD or RESTIC_PASSWORD_FILE must be configured"
+    fi
+}
+
+load_state() {
+    [ -f "$state_file" ] || return 1
+    # shellcheck disable=SC1090
+    . "$state_file"
+}
+
+save_state() {
+    mkdir -p "$state_dir"
+    umask 077
+    temporary="$state_file.tmp"
+    {
+        printf 'CURRENT_VERSION=%s\n' "$1"
+        printf 'CURRENT_API_IMAGE=%s\n' "$2"
+        printf 'CURRENT_WEB_IMAGE=%s\n' "$3"
+        printf 'PREVIOUS_VERSION=%s\n' "$4"
+        printf 'PREVIOUS_API_IMAGE=%s\n' "$5"
+        printf 'PREVIOUS_WEB_IMAGE=%s\n' "$6"
+    } > "$temporary"
+    mv "$temporary" "$state_file"
+}
+
+critical_counts() {
+    database=$1
+    docker compose exec -T postgres psql \
+        --username "$POSTGRES_USER" \
+        --dbname "$database" \
+        --tuples-only --no-align --field-separator='|' <<'SQL'
+SELECT 'accounts_user', COUNT(*) FROM accounts_user
+UNION ALL SELECT 'django_migrations', COUNT(*) FROM django_migrations
+UNION ALL SELECT 'market_marketbar', COUNT(*) FROM market_marketbar
+UNION ALL SELECT 'paper_ledgerentry', COUNT(*) FROM paper_ledgerentry
+UNION ALL SELECT 'paper_ledger_amount', COALESCE(SUM(amount), 0) FROM paper_ledgerentry
+UNION ALL SELECT 'paper_ledger_quantity', COALESCE(SUM(quantity), 0) FROM paper_ledgerentry
+ORDER BY 1;
+SQL
+}
+
+dump_database() {
+    backup_root=${BACKUP_DIR:-"$project_dir/backups"}
+    case "$backup_root" in
+        /|""|.) die "BACKUP_DIR must be a dedicated directory" ;;
+    esac
+    umask 077
+    mkdir -p "$backup_root"
+    timestamp=$(date -u +%Y%m%dT%H%M%SZ)
+    dump_path="$backup_root/mt-rotator-$timestamp.dump"
+    counts_path="$dump_path.counts"
+    temporary="$dump_path.tmp"
+    trap 'rm -f "${temporary:-}"' EXIT HUP INT TERM
+    docker compose exec -T postgres pg_dump \
+        --username "$POSTGRES_USER" \
+        --dbname "$POSTGRES_DB" \
+        --format=custom \
+        --compress=9 \
+        --no-owner \
+        --no-privileges > "$temporary"
+    docker compose exec -T postgres pg_restore --list < "$temporary" >/dev/null
+    mv "$temporary" "$dump_path"
+    critical_counts "$POSTGRES_DB" > "$counts_path"
+    trap - EXIT HUP INT TERM
+    printf '%s\n' "$dump_path"
+}
+
+backup_remote() {
+    require_command restic
+    load_backup_environment
+    dump_path=$(dump_database)
+    counts_path="$dump_path.counts"
+    staging=$(mktemp -d)
+    trap 'rm -rf "$staging"; rm -f "$dump_path" "$counts_path"' EXIT HUP INT TERM
+    cp "$dump_path" "$staging/database.dump"
+    cp "$counts_path" "$staging/counts.txt"
+    cp "$project_dir/.env" "$staging/application.env"
+    if [ -f "$state_file" ]; then
+        cp "$state_file" "$staging/deploy.env"
+    fi
+    restic backup "$staging" --tag mt-rotator-postgres
+    restic forget \
+        --tag mt-rotator-postgres \
+        --keep-daily 7 \
+        --keep-weekly 4 \
+        --keep-monthly 6 \
+        --prune
+    rm -rf "$staging"
+    rm -f "$dump_path" "$counts_path"
+    trap - EXIT HUP INT TERM
+}
+
+restore_verify() {
+    require_command restic
+    load_backup_environment
+    restore_root=$(mktemp -d)
+    verify_db="mt_rotator_verify_$(date -u +%Y%m%d%H%M%S)_$$"
+    cleanup_restore() {
+        docker compose exec -T postgres dropdb \
+            --if-exists --force --username "$POSTGRES_USER" "$verify_db" >/dev/null 2>&1 || true
+        rm -rf "$restore_root"
+    }
+    trap cleanup_restore EXIT HUP INT TERM
+    restic restore latest --tag mt-rotator-postgres --target "$restore_root"
+    dump_path=$(find "$restore_root" -type f -name database.dump -print -quit)
+    counts_path=$(find "$restore_root" -type f -name counts.txt -print -quit)
+    [ -n "$dump_path" ] && [ -n "$counts_path" ] || die "latest backup is incomplete"
+    docker compose exec -T postgres createdb --username "$POSTGRES_USER" "$verify_db"
+    docker compose exec -T postgres pg_restore \
+        --username "$POSTGRES_USER" \
+        --dbname "$verify_db" \
+        --exit-on-error \
+        --no-owner \
+        --no-privileges < "$dump_path" >/dev/null
+    docker compose exec -T \
+        -e DATABASE_URL= \
+        -e POSTGRES_DB="$verify_db" \
+        -e POSTGRES_HOST=postgres \
+        api python manage.py migrate --check
+    critical_counts "$verify_db" > "$restore_root/restored-counts.txt"
+    cmp "$counts_path" "$restore_root/restored-counts.txt" >/dev/null || die "restored row counts differ"
+    echo "Restore verification succeeded"
+}
+
+resolve_image() {
+    repository=$1
+    version=$2
+    docker pull "$repository:$version" >/dev/null
+    docker image inspect "$repository:$version" --format '{{index .RepoDigests 0}}'
+}
+
+deploy_images() {
+    export API_IMAGE="$1" WEB_IMAGE="$2"
+    compose up -d --no-build postgres redis
+    compose stop caddy beat worker api >/dev/null 2>&1 || true
+    compose up --no-build migrate
+    compose up -d --no-build --wait --wait-timeout 180 api worker beat caddy
+}
+
+lock_deployment() {
+    require_command flock
+    mkdir -p "$state_dir"
+    exec 9> "$state_dir/deploy.lock"
+    flock -n 9 || die "another deployment operation is running"
+}
+
+update_release() {
+    [ "$#" -eq 1 ] || die "usage: $0 update vX.Y.Z"
+    require_command docker
+    lock_deployment
+    version=$1
+    old_version=""
+    old_api=""
+    old_web=""
+    if load_state; then
+        old_version=$CURRENT_VERSION
+        old_api=$CURRENT_API_IMAGE
+        old_web=$CURRENT_WEB_IMAGE
+        backup_remote
+    elif [ "$(docker compose ps --status running --services postgres)" = "postgres" ]; then
+        backup_remote
+    fi
+    api_image=$(resolve_image "$api_repository" "$version")
+    web_image=$(resolve_image "$web_repository" "$version")
+    if ! deploy_images "$api_image" "$web_image"; then
+        if [ -n "$old_api" ] && [ -n "$old_web" ]; then
+            echo "Deployment failed; restoring previous application images" >&2
+            deploy_images "$old_api" "$old_web" || true
+        fi
+        die "deployment failed"
+    fi
+    save_state "$version" "$api_image" "$web_image" "$old_version" "$old_api" "$old_web"
+    echo "Deployed MT Rotator $version"
+}
+
+rollback_release() {
+    require_command docker
+    lock_deployment
+    load_state || die "no deployment state found"
+    [ -n "${PREVIOUS_API_IMAGE:-}" ] && [ -n "${PREVIOUS_WEB_IMAGE:-}" ] || die "no previous release found"
+    backup_remote
+    current_version=$CURRENT_VERSION
+    current_api=$CURRENT_API_IMAGE
+    current_web=$CURRENT_WEB_IMAGE
+    deploy_images "$PREVIOUS_API_IMAGE" "$PREVIOUS_WEB_IMAGE"
+    save_state \
+        "$PREVIOUS_VERSION" "$PREVIOUS_API_IMAGE" "$PREVIOUS_WEB_IMAGE" \
+        "$current_version" "$current_api" "$current_web"
+    echo "Rolled back MT Rotator to $PREVIOUS_VERSION"
+}
+
+show_status() {
+    if load_state; then
+        echo "release=$CURRENT_VERSION"
+        echo "api=$CURRENT_API_IMAGE"
+        echo "web=$CURRENT_WEB_IMAGE"
+    else
+        echo "release=local"
+    fi
+    docker compose ps
+}
+
+command_name=${1:-}
+[ -n "$command_name" ] || die "usage: $0 {update|rollback|backup|restore-verify|status}"
+shift
+load_application_environment
+case "$command_name" in
+    update) update_release "$@" ;;
+    rollback) [ "$#" -eq 0 ] || die "usage: $0 rollback"; rollback_release ;;
+    backup) [ "$#" -eq 0 ] || die "usage: $0 backup"; lock_deployment; backup_remote ;;
+    restore-verify)
+        [ "$#" -eq 0 ] || die "usage: $0 restore-verify"
+        lock_deployment
+        restore_verify
+        ;;
+    status) [ "$#" -eq 0 ] || die "usage: $0 status"; show_status ;;
+    *) die "unknown command: $command_name" ;;
+esac

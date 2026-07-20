@@ -1,4 +1,4 @@
-import { BarChart3, Database, FlaskConical, LayoutDashboard, LogOut, Moon, Shield, Sun, WalletCards } from 'lucide-react'
+import { Database, FlaskConical, LayoutDashboard, Lightbulb, LogOut, Moon, Search, Shield, Sun, Trophy, WalletCards } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { NavLink, Outlet, useNavigate } from 'react-router-dom'
 
@@ -7,9 +7,11 @@ import { PasswordDialog } from '../components/PasswordDialog'
 
 const navigation = [
     { to: '/', label: '总览', icon: LayoutDashboard },
-    { to: '/strategies', label: '策略', icon: BarChart3 },
+    { to: '/etfs', label: 'ETF', icon: Search },
+    { to: '/advice', label: '建议', icon: Lightbulb },
+    { to: '/trading', label: '交易', icon: WalletCards },
     { to: '/backtests', label: '回测', icon: FlaskConical },
-    { to: '/simulation', label: '模拟', icon: WalletCards }
+    { to: '/leaderboard', label: '排行', icon: Trophy }
 ]
 
 export function AppLayout() {

@@ -15,4 +15,5 @@ frontend/dist/
 frontend/playwright-report/
 frontend/test-results/
 backups/
+.state/
 .DS_Store

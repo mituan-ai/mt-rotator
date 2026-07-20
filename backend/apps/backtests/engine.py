@@ -6,8 +6,9 @@ from decimal import Decimal
 
 import pandas as pd
 
-from apps.market.calendar import is_month_end_session
 from apps.market.models import CorporateAction
+from apps.paper.models import PaperAccount
+from apps.paper.policy import material_change, resolve_stable_targets, scale_strategy_targets
 from apps.strategies.engine import evaluate
 from apps.strategies.execution import rebalance
 
@@ -91,11 +92,14 @@ def run_event_backtest(
     corporate_events: list[dict] = []
     holdings: list[dict] = []
     holdings_history: dict[date, dict[str, int]] = {}
+    acquired_index: dict[str, int] = {}
+    sold_index: dict[str, int] = {}
+    previous_raw_targets: dict[str, Decimal] = {}
     actions = actions or []
     total_fees = Decimal("0")
     last_closes: dict[str, Decimal] = {}
 
-    for timestamp in dates:
+    for date_index, timestamp in enumerate(dates):
         current_date = timestamp.date()
         cash, positions, events = _apply_corporate_actions(
             when=current_date,
@@ -109,6 +113,7 @@ def run_event_backtest(
         last_closes.update({symbol: bar["close"] for symbol, bar in bars.items()})
 
         if pending and pending["tradable_on"] == current_date:
+            positions_before = dict(positions)
             execution = rebalance(
                 cash=cash, positions=positions, target_weights=pending["target_weights"], bars=bars
             )
@@ -128,6 +133,14 @@ def run_event_backtest(
                 }
                 (trades if item.status == "filled" else rejected).append(record)
                 total_fees += item.fee
+                if (
+                    item.status == "filled"
+                    and item.side == "buy"
+                    and positions_before.get(item.symbol, 0) == 0
+                ):
+                    acquired_index[item.symbol] = date_index
+                if item.status == "filled" and item.side == "sell" and positions.get(item.symbol, 0) == 0:
+                    sold_index[item.symbol] = date_index
             pending = None
 
         close_value = cash
@@ -146,31 +159,71 @@ def run_event_backtest(
             }
         )
 
-        if is_month_end_session(current_date):
-            try:
-                decision = evaluate(strategy_slug, hfq, current_date)
-            except ValueError:
-                continue
-            pending = {
-                "signal_date": current_date,
-                "tradable_on": decision.tradable_on,
-                "target_weights": decision.target_weights,
-            }
-            allocations.append(
-                {
-                    "signal_date": current_date.isoformat(),
-                    "tradable_on": decision.tradable_on.isoformat(),
-                    "target_weights": decision.target_weights,
-                    "rationale": decision.rationale,
-                }
+        try:
+            amounts = raw.get("amount", None)
+            decision = evaluate(strategy_slug, hfq, current_date, amounts)
+        except ValueError:
+            continue
+        raw_targets = scale_strategy_targets(
+            risk_level=PaperAccount.RiskLevel.BALANCED,
+            target_weights=decision.target_weights,
+            selected=decision.rationale.get("selected") or list(decision.target_weights),
+            market_state=decision.rationale.get("market_state", "neutral"),
+        )
+        current_weights = {
+            symbol: Decimal(shares) * last_closes[symbol] / close_value
+            for symbol, shares in positions.items()
+            if shares > 0 and symbol in last_closes and close_value > 0
+        }
+        resolution = resolve_stable_targets(
+            raw_targets=raw_targets,
+            current_weights=current_weights,
+            prior_raw_targets=previous_raw_targets,
+            holding_ages={
+                symbol: date_index - acquired_index.get(symbol, date_index) for symbol in positions
+            },
+            cooldown_ages={
+                symbol: date_index - sold_at
+                for symbol, sold_at in sold_index.items()
+                if not positions.get(symbol)
+            },
+        )
+        target_weights = {}
+        for symbol in set(resolution.targets) | set(current_weights):
+            target = resolution.targets.get(symbol, Decimal("0"))
+            current = current_weights.get(symbol, Decimal("0"))
+            trade_value = abs(target - current) * close_value
+            target_weights[symbol] = float(
+                target
+                if material_change(
+                    target_weight=target,
+                    current_weight=current,
+                    trade_value=trade_value,
+                )
+                else current
             )
+        previous_raw_targets = raw_targets
+        pending = {
+            "signal_date": current_date,
+            "tradable_on": decision.tradable_on,
+            "target_weights": target_weights,
+        }
+        allocations.append(
+            {
+                "signal_date": current_date.isoformat(),
+                "tradable_on": decision.tradable_on.isoformat(),
+                "target_weights": target_weights,
+                "raw_target_weights": {symbol: str(weight) for symbol, weight in raw_targets.items()},
+                "rationale": decision.rationale,
+            }
+        )
 
     nav = pd.Series({item["date"]: item["value"] for item in nav_records}, dtype=float)
     metrics = calculate_metrics(nav, initial_capital, total_fees, trades)
     return {
         "assumptions": {
             "initial_capital": str(initial_capital),
-            "signal_timing": "month_end_close",
+            "signal_timing": "daily_close_with_confirmation",
             "fill_timing": "next_session_open",
             "commission_rate": "0.0003",
             "minimum_commission": "5.00",

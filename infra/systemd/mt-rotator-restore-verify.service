@@ -1,0 +1,10 @@
+[Unit]
+Description=Verify the latest MT Rotator backup by restoring it
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/mt-rotator
+EnvironmentFile=/etc/mt-rotator/backup.env
+ExecStart=/opt/mt-rotator/ops/mt-rotator restore-verify

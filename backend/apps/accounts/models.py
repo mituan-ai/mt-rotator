@@ -5,6 +5,7 @@ from typing import ClassVar
 
 from django.contrib.auth.models import AbstractUser, BaseUserManager
 from django.db import models
+from django.db.models.functions import Lower
 
 
 def normalize_email_address(value: str) -> str:
@@ -40,6 +41,9 @@ class User(AbstractUser):
     USERNAME_FIELD: ClassVar[str] = "email"  # type: ignore[misc]
     REQUIRED_FIELDS: ClassVar[list[str]] = []
     objects: ClassVar[UserManager] = UserManager()  # type: ignore[assignment]
+
+    class Meta:
+        constraints = [models.UniqueConstraint(Lower("display_name"), name="unique_user_display_name_ci")]
 
     def save(self, *args, **kwargs):
         self.email = normalize_email_address(self.email)

@@ -11,7 +11,7 @@ from apps.market.calendar import sessions_in_range
 from apps.strategies.engine import DEFENSIVE_WEIGHTS, RISK_SYMBOLS
 
 
-def test_event_backtest_fills_only_after_month_end_signal():
+def test_event_backtest_fills_only_after_confirmed_daily_advice():
     dates = pd.to_datetime(sessions_in_range(date(2023, 1, 3), date(2025, 3, 31)))
     symbols = RISK_SYMBOLS + list(DEFENSIVE_WEIGHTS)
     hfq = pd.DataFrame(

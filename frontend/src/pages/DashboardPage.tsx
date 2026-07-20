@@ -1,9 +1,9 @@
 import { useQuery } from '@tanstack/react-query'
-import { Activity, ArrowUpRight, Clock3, Database, WalletCards } from 'lucide-react'
+import { Activity, ArrowUpRight, Database, Lightbulb, WalletCards } from 'lucide-react'
 import { Link } from 'react-router-dom'
 
-import { api } from '../api/client'
-import type { MarketStatus, Page, PaperAccount, Strategy } from '../api/types'
+import { api, ApiError } from '../api/client'
+import type { Advice, MarketStatus, Page, PaperAccount } from '../api/types'
 import { EmptyState } from '../components/EmptyState'
 import { Loading } from '../components/Loading'
 import { Metric } from '../components/Metric'
@@ -11,60 +11,71 @@ import { StatusBadge } from '../components/StatusBadge'
 
 export function DashboardPage() {
     const market = useQuery({ queryKey: ['market-status'], queryFn: () => api.get<MarketStatus>('/market/status') })
-    const strategies = useQuery({ queryKey: ['strategies'], queryFn: () => api.get<Page<Strategy>>('/strategies/') })
-    const accounts = useQuery({ queryKey: ['paper-accounts'], queryFn: () => api.get<Page<PaperAccount>>('/paper/accounts') })
-    if (market.isLoading || strategies.isLoading || accounts.isLoading) return <Loading />
+    const accounts = useQuery({ queryKey: ['paper-accounts'], queryFn: () => api.get<Page<PaperAccount>>('/paper/accounts?page_size=100') })
+    const account = accounts.data?.results.find((item) => item.mode === 'manual' && item.status === 'active')
+    const advice = useQuery({
+        queryKey: ['paper-advice-current', account?.id, account?.strategy_id, account?.risk_level],
+        queryFn: () => api.get<Advice>(`/paper/accounts/${account?.id}/advice/current`),
+        enabled: Boolean(account?.id && account?.strategy_id),
+        retry: (count, error) => !(error instanceof ApiError && error.status === 404) && count < 1
+    })
+    if (market.isLoading || accounts.isLoading) return <Loading />
+
+    const actionable = advice.data?.recommendations.filter((item) => item.actionable) || []
+    const status = market.data
 
     return (
         <div className="page-stack">
             <header className="page-header">
                 <div><p className="eyebrow">OVERVIEW</p><h1>总览</h1></div>
-                <StatusBadge ok={Boolean(market.data?.ready)}>{market.data?.ready ? '数据已就绪' : '数据不可用'}</StatusBadge>
+                <StatusBadge ok={Boolean(status?.ready)}>{status?.ready ? '建议数据已就绪' : '新建议暂停'}</StatusBadge>
             </header>
             <section className="metric-grid">
-                <Metric label="行情截止" value={market.data?.expected_session || '—'} />
-                <Metric label="运行策略" value={`${strategies.data?.count || 0}`} />
-                <Metric label="模拟账户" value={`${accounts.data?.results.filter((item) => item.status === 'active').length || 0}`} />
-                <Metric label="数据来源" value="东方财富" />
+                <Metric label="ETF目录" value={`${(status?.counts.catalog || 0).toLocaleString('zh-CN')} 只`} />
+                <Metric label="可模拟交易" value={`${(status?.counts.trade_eligible || 0).toLocaleString('zh-CN')} 只`} />
+                <Metric label="可进入建议" value={`${(status?.counts.advice_eligible || 0).toLocaleString('zh-CN')} 只`} />
+                <Metric label="行情截止" value={status?.expected_session || '—'} />
             </section>
             <section className="section-grid two-columns">
                 <article className="panel">
-                    <div className="panel-heading"><div><p className="eyebrow">SIGNALS</p><h2>最新信号</h2></div><Link to="/strategies">全部策略 <ArrowUpRight size={15} /></Link></div>
-                    <div className="list-stack">
-                        {strategies.data?.results.map((strategy) => <SignalRow key={strategy.id} strategy={strategy} />)}
-                    </div>
+                    <div className="panel-heading"><div><p className="eyebrow">ACCOUNT</p><h2>自主账户</h2></div><Link to="/trading">交易 <ArrowUpRight size={15} /></Link></div>
+                    {!account ? <EmptyState title="账户尚未建立" detail="刷新后仍未出现时请联系管理员。" /> : (
+                        <div className="account-overview">
+                            <div className="account-identity"><div className="row-icon"><WalletCards size={18} /></div><div><strong>#{account.account_number}</strong><span>{riskText(account.risk_level)} · {account.strategy_name || '未选择建议策略'}</span></div></div>
+                            <strong className="account-nav">¥{Number(account.latest_nav?.value || account.cash).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</strong>
+                            <div className="account-cash"><span>现金</span><strong>¥{Number(account.cash).toLocaleString('zh-CN', { maximumFractionDigits: 2 })}</strong></div>
+                        </div>
+                    )}
                 </article>
                 <article className="panel">
-                    <div className="panel-heading"><div><p className="eyebrow">ACCOUNTS</p><h2>模拟账户</h2></div><Link to="/simulation">账户详情 <ArrowUpRight size={15} /></Link></div>
-                    {!accounts.data?.results.some((item) => item.status === 'active') ? <EmptyState title="尚未激活账户" detail="选择策略后即可开始自动模拟。" /> : (
-                        <div className="list-stack">
-                            {accounts.data.results.filter((item) => item.status === 'active').map((account) => (
-                                <div className="account-row" key={account.id}>
-                                    <div className="row-icon"><WalletCards size={18} /></div>
-                                    <div><strong>{account.strategy_name}</strong><span>第 {account.generation} 期</span></div>
-                                    <div className="row-value"><strong>¥{Number(account.latest_nav?.value || account.cash).toLocaleString('zh-CN', { maximumFractionDigits: 2 })}</strong><span>可用 ¥{Number(account.cash).toLocaleString('zh-CN')}</span></div>
-                                </div>
-                            ))}
+                    <div className="panel-heading"><div><p className="eyebrow">ADVICE</p><h2>最新建议</h2></div><Link to="/advice">详情 <ArrowUpRight size={15} /></Link></div>
+                    {!account?.strategy_id ? <EmptyState title="尚未选择策略" detail="前往建议页选择策略和风险档位。" /> : advice.isLoading ? <Loading /> : advice.error ? <EmptyState title="建议尚未生成" detail={advice.error.message} /> : advice.data && (
+                        <div className="advice-overview">
+                            <div className="advice-overview-head"><div className="row-icon"><Lightbulb size={18} /></div><div><strong>{advice.data.strategy_name}</strong><span>{advice.data.session_date} · 有效至 {advice.data.expires_on}</span></div><StatusBadge ok={!advice.data.stale}>{advice.data.stale ? '已过期' : '有效'}</StatusBadge></div>
+                            {actionable.length ? <div className="mini-advice-list">{actionable.slice(0, 4).map((item) => <div key={item.symbol}><strong>{item.symbol}</strong><span>{actionText(item.action)} {item.quantity.toLocaleString()}份</span></div>)}</div> : <p className="muted-copy">当前没有需要确认的持仓调整。</p>}
                         </div>
                     )}
                 </article>
             </section>
-            <article className="panel data-trust-panel">
-                <div className="trust-item"><Database size={18} /><div><strong>{market.data?.source}</strong><span>日线收盘后更新，不作为实时行情</span></div></div>
-                <div className="trust-item"><Activity size={18} /><div><strong>{market.data?.last_batch?.status || '尚无批次'}</strong><span>校验来源：{market.data?.validation_source}</span></div></div>
-                <div className="trust-item"><Clock3 size={18} /><div><strong>次日开盘估算</strong><span>信号不会使用同日收盘价成交</span></div></div>
+            <article className="panel data-health-panel">
+                <div className="panel-heading"><div><p className="eyebrow">MARKET DATA</p><h2>数据健康</h2></div><Link to="/etfs">ETF目录 <ArrowUpRight size={15} /></Link></div>
+                <div className="health-counts">
+                    <div><span className="health-dot ready" /><strong>{status?.counts.ready || 0}</strong><span>正常</span></div>
+                    <div><span className="health-dot stale" /><strong>{status?.counts.stale || 0}</strong><span>陈旧</span></div>
+                    <div><span className="health-dot missing" /><strong>{status?.counts.missing || 0}</strong><span>缺失</span></div>
+                    <div><span className="health-dot blocked" /><strong>{status?.counts.blocked || 0}</strong><span>暂停</span></div>
+                </div>
+                {status?.instruments.length ? <div className="health-warning"><Activity size={17} /><span>{status.instruments.length} 只ETF需要更新或人工处理；其他正常ETF仍可查询和委托。</span></div> : null}
+                <div className="trust-line"><Database size={15} /><span>{status?.source || '新浪财经，经 AKShare 获取'} · 原始日线 · 覆盖率 {`${(Number(status?.coverage || 0) * 100).toFixed(1)}%`}</span></div>
             </article>
         </div>
     )
 }
 
-function SignalRow({ strategy }: { strategy: Strategy }) {
-    const signal = strategy.latest_signal
-    return (
-        <div className="signal-row">
-            <div className="row-icon"><Activity size={18} /></div>
-            <div><strong>{strategy.name}</strong><span>版本 {strategy.version}</span></div>
-            <div className="row-value"><strong>{signal ? '已有信号' : '等待信号'}</strong><span>{signal ? `${signal.signal_date} 收盘后` : '月末收盘后生成'}</span></div>
-        </div>
-    )
+function riskText(value: PaperAccount['risk_level']): string {
+    return { conservative: '保守', balanced: '均衡', aggressive: '进取' }[value]
+}
+
+function actionText(value: string): string {
+    return { buy: '买入', reduce: '减仓', sell: '卖出' }[value] || value
 }

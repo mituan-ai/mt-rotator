@@ -11,6 +11,12 @@ import { Metric } from '../components/Metric'
 import { StatusBadge } from '../components/StatusBadge'
 
 const COLORS = ['#315efb', '#d64545', '#11835c', '#8b5cf6']
+const TODAY = new Date().toISOString().slice(0, 10)
+const ONE_YEAR_AGO = (() => {
+    const value = new Date()
+    value.setFullYear(value.getFullYear() - 1)
+    return value.toISOString().slice(0, 10)
+})()
 
 export function BacktestsPage() {
     const queryClient = useQueryClient()
@@ -24,8 +30,8 @@ export function BacktestsPage() {
         refetchInterval: (query) => query.state.data?.results.some((item) => ['queued', 'running'].includes(item.status)) ? 3000 : false
     })
     const [strategyId, setStrategyId] = useState('')
-    const [startDate, setStartDate] = useState('2015-01-01')
-    const [endDate, setEndDate] = useState(new Date().toISOString().slice(0, 10))
+    const [startDate, setStartDate] = useState(ONE_YEAR_AGO)
+    const [endDate, setEndDate] = useState(TODAY)
     const [selectedIds, setSelectedIds] = useState<string[]>([])
     const [selectionError, setSelectionError] = useState('')
     const details = useQueries({
@@ -78,13 +84,13 @@ export function BacktestsPage() {
 
     return (
         <div className="page-stack">
-            <header className="page-header"><div><p className="eyebrow">RESEARCH</p><h1>回测</h1><p>结果绑定策略版本、数据快照和成交假设。</p></div></header>
+            <header className="page-header"><div><p className="eyebrow">RESEARCH</p><h1>回测</h1><p>从空仓开始自动采纳全部建议，用于评估建议政策。</p></div></header>
             <section className="backtest-layout">
                 <form className="panel backtest-form" onSubmit={submit}>
                     <div className="panel-heading"><div><p className="eyebrow">NEW RUN</p><h2>新建回测</h2></div><FlaskConical size={20} /></div>
                     <label>策略<select required value={strategyId} onChange={(event) => setStrategyId(event.target.value)}><option value="">选择策略</option>{strategies.data?.results.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
                     <div className="form-row"><label>开始日期<input type="date" value={startDate} onChange={(event) => setStartDate(event.target.value)} /></label><label>结束日期<input type="date" value={endDate} onChange={(event) => setEndDate(event.target.value)} /></label></div>
-                    <div className="assumption-box"><span>初始资金 ¥100,000</span><span>佣金 万3 / 最低¥5</span><span>滑点 5 bps</span><span>次日开盘估算成交</span></div>
+                    <div className="assumption-box"><span>均衡风险档位</span><span>初始资金 ¥100,000</span><span>佣金 万3 / 最低¥5</span><span>滑点 5 bps</span><span>次日开盘估算成交</span></div>
                     {create.error && <p className="form-error">{create.error.message}</p>}
                     <button className="primary-button" disabled={create.isPending || !strategyId}>{create.isPending ? '正在创建' : '开始回测'}</button>
                 </form>
@@ -137,7 +143,7 @@ function BacktestComparison({ runs, loading, onRemove, onCancel }: { runs: Backt
                 })}
             </div>
             {succeeded.length > 0 && <Chart option={option} height={360} />}
-            {succeeded[0] && <div className="data-footnote">数据截止 {succeeded[0].data_snapshot.cutoff_date} · {succeeded[0].data_snapshot.provider} · 后复权信号 / 原始价成交</div>}
+            {succeeded[0] && <div className="data-footnote">数据截止 {succeeded[0].data_snapshot.cutoff_date} · {succeeded[0].data_snapshot.provider} · 分红总收益研究 / 原始价成交</div>}
         </article>
     )
 }

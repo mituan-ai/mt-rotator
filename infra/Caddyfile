@@ -1,26 +1,28 @@
+{
+	skip_install_trust
+}
+
 {$SITE_ADDRESS:localhost} {
-    encode zstd gzip
+	encode zstd gzip
 
-    header {
-        -Server
-        X-Content-Type-Options "nosniff"
-        X-Frame-Options "DENY"
-        Referrer-Policy "same-origin"
-        Permissions-Policy "camera=(), microphone=(), geolocation=()"
-        Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
-    }
+	header {
+		-Server
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "same-origin"
+		Permissions-Policy "camera=(), microphone=(), geolocation=()"
+		Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
+	}
 
-    @backend path /api/* /internal-admin/* /django-static/*
-    handle @backend {
-        reverse_proxy api:8000 {
-            header_up X-Forwarded-Proto {scheme}
-            header_up X-Forwarded-For {remote_host}
-        }
-    }
+	@backend path /api/* /internal-admin/* /django-static/*
+	handle @backend {
+		reverse_proxy api:8000 {
+		}
+	}
 
-    handle {
-        root * /srv
-        try_files {path} /index.html
-        file_server
-    }
+	handle {
+		root * /srv
+		try_files {path} /index.html
+		file_server
+	}
 }

@@ -1,19 +1,34 @@
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from datetime import date
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 import pandas as pd
 
-REQUIRED_BAR_COLUMNS = {"日期", "开盘", "收盘", "最高", "最低", "成交量"}
-DIVIDEND_FUND_TYPES = ["指数型-股票", "指数型-固收", "货币型-普通货币"]
-SPLIT_FUND_TYPES = ["指数型-股票", "指数型-固收", "货币型"]
+REQUIRED_BAR_COLUMNS = {"trade_date", "open", "high", "low", "close", "volume"}
+BAR_ALIASES = {
+    "日期": "trade_date",
+    "date": "trade_date",
+    "开盘": "open",
+    "最高": "high",
+    "最低": "low",
+    "收盘": "close",
+    "成交量": "volume",
+    "成交额": "amount",
+}
 
 
 class ProviderError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class CatalogRecord:
+    symbol: str
+    name: str
+    exchange: str
+    bar: dict[str, Decimal] | None
 
 
 @dataclass(frozen=True)
@@ -33,160 +48,151 @@ def _akshare():
     return ak
 
 
+def _number(value) -> Decimal | None:
+    if value is None or pd.isna(value) or str(value).strip() in {"", "-", "--", "None", "nan"}:
+        return None
+    try:
+        return Decimal(str(value).replace(",", ""))
+    except InvalidOperation:
+        return None
+
+
 def normalize_bars(frame: pd.DataFrame) -> pd.DataFrame:
-    missing = REQUIRED_BAR_COLUMNS - set(frame.columns)
+    result = frame.rename(columns=BAR_ALIASES).copy()
+    missing = REQUIRED_BAR_COLUMNS - set(result.columns)
     if missing:
         raise ProviderError(f"行情字段缺失: {sorted(missing)}")
-    result = frame.rename(
-        columns={
-            "日期": "trade_date",
-            "开盘": "open",
-            "最高": "high",
-            "最低": "low",
-            "收盘": "close",
-            "成交量": "volume",
-        }
-    )[["trade_date", "open", "high", "low", "close", "volume"]].copy()
+    if "amount" not in result:
+        result["amount"] = 0
+    result = result[["trade_date", "open", "high", "low", "close", "volume", "amount"]]
     result["trade_date"] = pd.to_datetime(result["trade_date"], errors="raise").dt.date
-    for column in ["open", "high", "low", "close", "volume"]:
+    for column in ["open", "high", "low", "close", "volume", "amount"]:
         result[column] = pd.to_numeric(result[column], errors="raise")
     if result["trade_date"].duplicated().any():
         raise ProviderError("行情包含重复日期")
     prices = result[["open", "high", "low", "close"]]
-    if (prices <= 0).any().any() or (result["volume"] < 0).any():
-        raise ProviderError("行情包含非正价格或负成交量")
-    if (
-        (result["high"] < prices[["open", "close"]].max(axis=1))
-        | (result["low"] > prices[["open", "close"]].min(axis=1))
-    ).any():
+    if (prices <= 0).any().any() or (result[["volume", "amount"]] < 0).any().any():
+        raise ProviderError("行情包含非正价格或负成交量/成交额")
+    invalid_ohlc = (result["high"] < prices.max(axis=1)) | (result["low"] > prices.min(axis=1))
+    if invalid_ohlc.any():
         raise ProviderError("OHLC关系无效")
     return result.sort_values("trade_date").reset_index(drop=True)
 
 
-class EastmoneyProvider:
-    name = "eastmoney-akshare"
+def _symbol_parts(value: object) -> tuple[str, str] | None:
+    raw = str(value).strip().lower()
+    symbol = raw[-6:]
+    if not symbol.isdigit():
+        return None
+    if raw.startswith("sh") or symbol.startswith("5"):
+        return symbol, "XSHG"
+    if raw.startswith("sz") or symbol.startswith("1"):
+        return symbol, "XSHE"
+    return None
 
-    def fetch_bars(self, symbol: str, start: date, end: date, adjustment: str) -> pd.DataFrame:
-        adjust = "" if adjustment == "raw" else "hfq"
-        try:
-            frame = _akshare().fund_etf_hist_em(
-                symbol=symbol,
-                period="daily",
-                start_date=start.strftime("%Y%m%d"),
-                end_date=end.strftime("%Y%m%d"),
-                adjust=adjust,
-            )
-        except Exception as exc:
-            raise ProviderError(f"{symbol} 行情下载失败: {exc}") from exc
-        if frame is None or frame.empty:
-            raise ProviderError(f"{symbol} 行情为空")
-        return normalize_bars(frame)
 
-    def fetch_instrument_names(self) -> dict[str, str]:
-        try:
-            frame = _akshare().fund_etf_spot_em()
-        except Exception as exc:
-            raise ProviderError(f"ETF列表下载失败: {exc}") from exc
-        if frame is None or frame.empty or not {"代码", "名称"}.issubset(frame.columns):
-            raise ProviderError("ETF列表字段无效")
-        return {str(row["代码"]).zfill(6): str(row["名称"]) for _, row in frame.iterrows()}
+class SinaProvider:
+    name = "sina-akshare"
+    request_interval_seconds = 0.2
 
-    def fetch_corporate_actions(self, year: int, symbols: set[str]) -> list[CorporateActionRecord]:
-        records: list[CorporateActionRecord] = []
-        ak = _akshare()
+    def fetch_catalog(self) -> list[CatalogRecord]:
         try:
-            dividend_frames = [ak.fund_fh_em(year=str(year), typ=kind) for kind in DIVIDEND_FUND_TYPES]
-            split_frames = [ak.fund_cf_em(year=str(year), typ=kind) for kind in SPLIT_FUND_TYPES]
-            dividends = pd.concat(dividend_frames, ignore_index=True)
-            splits = pd.concat(split_frames, ignore_index=True)
+            frame = _akshare().fund_etf_category_sina(symbol="ETF基金")
         except Exception as exc:
-            raise ProviderError(f"{year}年公司行动下载失败: {exc}") from exc
-        if dividends is not None and not dividends.empty:
-            for _, row in dividends.iterrows():
-                symbol = str(row.get("基金代码", "")).zfill(6)
-                if symbol not in symbols:
-                    continue
-                effective = _date_or_none(row.get("除息日期"))
-                if not effective:
-                    continue
-                records.append(
-                    CorporateActionRecord(
-                        symbol=symbol,
-                        kind="cash_dividend",
-                        record_date=_date_or_none(row.get("权益登记日")),
-                        effective_date=effective,
-                        payment_date=_date_or_none(row.get("分红发放日")),
-                        value=Decimal(str(row.get("分红", 0))),
-                        detail={"source": "fund_fh_em", "year": year},
-                    )
+            raise ProviderError(f"ETF目录下载失败: {exc}") from exc
+        required = {"代码", "名称", "最新价", "今开", "最高", "最低", "成交量", "成交额"}
+        if frame is None or frame.empty or not required.issubset(frame.columns):
+            raise ProviderError("ETF目录字段无效")
+
+        records: list[CatalogRecord] = []
+        for row in frame.to_dict("records"):
+            parts = _symbol_parts(row.get("代码"))
+            if not parts:
+                continue
+            symbol, exchange = parts
+            values = {
+                "open": _number(row.get("今开")),
+                "high": _number(row.get("最高")),
+                "low": _number(row.get("最低")),
+                "close": _number(row.get("最新价")),
+                "volume": _number(row.get("成交量")),
+                "amount": _number(row.get("成交额")),
+            }
+            bar = None
+            complete_values = {field: value for field, value in values.items() if value is not None}
+            if (
+                len(complete_values) == len(values)
+                and all(complete_values[field] > 0 for field in ["open", "high", "low", "close"])
+                and all(complete_values[field] >= 0 for field in ["volume", "amount"])
+            ):
+                bar = complete_values
+            records.append(
+                CatalogRecord(
+                    symbol=symbol,
+                    name=str(row.get("名称", symbol)).strip()[:80],
+                    exchange=exchange,
+                    bar=bar,
                 )
-        if splits is not None and not splits.empty:
-            for _, row in splits.iterrows():
-                symbol = str(row.get("基金代码", "")).zfill(6)
-                if symbol not in symbols:
-                    continue
-                effective = _date_or_none(row.get("拆分折算日"))
-                factor = _decimal_from_text(row.get("拆分折算"))
-                if effective and factor and factor > 0:
-                    records.append(
-                        CorporateActionRecord(
-                            symbol=symbol,
-                            kind="split",
-                            record_date=None,
-                            effective_date=effective,
-                            payment_date=None,
-                            value=factor,
-                            detail={"source": "fund_cf_em", "type": str(row.get("拆分类型", ""))},
-                        )
-                    )
+            )
+        if not records:
+            raise ProviderError("ETF目录没有有效代码")
         return records
 
-
-class SinaValidator:
-    name = "sina-akshare"
-
-    def fetch_bars(self, symbol: str) -> pd.DataFrame:
+    def fetch_bars(self, symbol: str, start: date, end: date) -> pd.DataFrame:
         prefix = "sh" if symbol.startswith("5") else "sz"
         try:
             frame = _akshare().fund_etf_hist_sina(symbol=f"{prefix}{symbol}")
         except Exception as exc:
-            raise ProviderError(f"新浪校验失败: {exc}") from exc
+            raise ProviderError(f"{symbol} 行情下载失败: {exc}") from exc
         if frame is None or frame.empty:
-            raise ProviderError("新浪校验行情为空")
-        aliases = {
-            "date": "日期",
-            "open": "开盘",
-            "high": "最高",
-            "low": "最低",
-            "close": "收盘",
-            "volume": "成交量",
-        }
-        return normalize_bars(frame.rename(columns=aliases))
+            raise ProviderError(f"{symbol} 行情为空")
+        normalized = normalize_bars(frame)
+        result = normalized.loc[
+            (normalized["trade_date"] >= start) & (normalized["trade_date"] <= end)
+        ].reset_index(drop=True)
+        if result.empty:
+            raise ProviderError(f"{symbol} 在请求区间内没有行情")
+        return result
 
-    def fetch_dividends(self, symbol: str) -> pd.DataFrame:
+    def fetch_dividends(self, symbol: str) -> list[CorporateActionRecord]:
         prefix = "sh" if symbol.startswith("5") else "sz"
         try:
             frame = _akshare().fund_etf_dividend_sina(symbol=f"{prefix}{symbol}")
         except Exception as exc:
-            raise ProviderError(f"新浪分红校验失败: {exc}") from exc
+            raise ProviderError(f"{symbol} 分红下载失败: {exc}") from exc
         if frame is None or frame.empty:
-            return pd.DataFrame(columns=["date", "cumulative"])
+            return []
         if not {"日期", "累计分红"}.issubset(frame.columns):
-            raise ProviderError("新浪分红校验字段无效")
-        result = frame.rename(columns={"日期": "date", "累计分红": "cumulative"})[
+            raise ProviderError("新浪分红字段无效")
+        values = frame.rename(columns={"日期": "date", "累计分红": "cumulative"})[
             ["date", "cumulative"]
         ].copy()
-        result["date"] = pd.to_datetime(result["date"], errors="raise").dt.date
-        result["cumulative"] = pd.to_numeric(result["cumulative"], errors="raise")
-        return result.sort_values("date").reset_index(drop=True)
+        values["date"] = pd.to_datetime(values["date"], errors="raise").dt.date
+        values["cumulative"] = pd.to_numeric(values["cumulative"], errors="raise")
+        values = values.sort_values("date").reset_index(drop=True)
 
-
-def _date_or_none(value) -> date | None:
-    if value is None or pd.isna(value) or str(value).strip() in {"", "-"}:
-        return None
-    return pd.to_datetime(value).date()
-
-
-def _decimal_from_text(value) -> Decimal | None:
-    match = re.search(r"\d+(?:\.\d+)?", str(value))
-    return Decimal(match.group()) if match else None
+        records: list[CorporateActionRecord] = []
+        previous = Decimal("0")
+        for row in values.to_dict("records"):
+            cumulative = Decimal(str(row["cumulative"]))
+            delta = cumulative - previous
+            previous = cumulative
+            if delta <= 0:
+                continue
+            effective_date = row["date"]
+            records.append(
+                CorporateActionRecord(
+                    symbol=symbol,
+                    kind="cash_dividend",
+                    record_date=None,
+                    effective_date=effective_date,
+                    payment_date=effective_date,
+                    value=delta,
+                    detail={
+                        "source": "fund_etf_dividend_sina",
+                        "cumulative": str(cumulative),
+                        "payment_date_estimated": True,
+                    },
+                )
+            )
+        return records

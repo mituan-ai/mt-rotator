@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the MT Rotator backup every day
+
+[Timer]
+OnCalendar=*-*-* 02:30:00 Asia/Shanghai
+Persistent=true
+RandomizedDelaySec=10m
+Unit=mt-rotator-backup.service
+
+[Install]
+WantedBy=timers.target

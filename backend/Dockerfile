@@ -20,7 +20,8 @@ WORKDIR /app
 COPY --from=builder --chown=mtrotator:mtrotator /app/.venv /app/.venv
 COPY --chown=mtrotator:mtrotator . /app
 RUN mkdir -p /app/staticfiles \
-    && chown mtrotator:mtrotator /app/staticfiles \
+    && MT_TESTING=1 python manage.py collectstatic --noinput \
+    && chown -R mtrotator:mtrotator /app/staticfiles \
     && chmod 0755 /app/docker-entrypoint.sh
 USER mtrotator
 EXPOSE 8000

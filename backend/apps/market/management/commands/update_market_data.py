@@ -9,11 +9,12 @@ class Command(BaseCommand):
     help = "Fetch and validate the free ETF end-of-day dataset"
 
     def add_arguments(self, parser):
-        parser.add_argument("--start", default="2010-01-01")
+        parser.add_argument("--start", default=None)
 
     def handle(self, *args, **options):
         batch = import_market_data(
-            triggered_by="management-command", start=date.fromisoformat(options["start"])
+            triggered_by="management-command",
+            start=date.fromisoformat(options["start"]) if options["start"] else None,
         )
         self.stdout.write(f"batch={batch.id} status={batch.status} rows={batch.row_count}")
         if batch.errors:

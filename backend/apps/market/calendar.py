@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, time, timedelta
 from functools import lru_cache
 
 import exchange_calendars as xcals
 import pandas as pd
+from django.utils import timezone
 
 
 @lru_cache(maxsize=1)
@@ -13,7 +14,11 @@ def calendar():
 
 
 def latest_expected_session(on_date: date | None = None) -> date:
-    target = pd.Timestamp(on_date or date.today())
+    now = timezone.localtime()
+    target_date = on_date or now.date()
+    if on_date is None and calendar().is_session(pd.Timestamp(target_date)) and now.time() < time(15, 0):
+        target_date -= timedelta(days=1)
+    target = pd.Timestamp(target_date)
     session = calendar().date_to_session(target, direction="previous")
     return session.date()
 

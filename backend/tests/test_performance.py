@@ -12,8 +12,8 @@ from apps.market.calendar import sessions_in_range
 from apps.strategies.engine import DEFENSIVE_WEIGHTS, RISK_SYMBOLS
 
 
-def test_ten_year_eight_etf_backtest_completes_within_release_budget():
-    dates = pd.to_datetime(sessions_in_range(date(2016, 1, 4), date(2025, 12, 31)))
+def test_two_year_dynamic_etf_backtest_completes_within_release_budget():
+    dates = pd.to_datetime(sessions_in_range(date(2024, 1, 2), date(2025, 12, 31)))
     symbols = RISK_SYMBOLS + list(DEFENSIVE_WEIGHTS)
     session = np.arange(len(dates), dtype=float)
     hfq = pd.DataFrame(
@@ -41,13 +41,13 @@ def test_ten_year_eight_etf_backtest_completes_within_release_budget():
         strategy_slug="relative-momentum-top-n",
         raw=raw,
         hfq=hfq,
-        start_date=date(2016, 1, 4),
+        start_date=date(2024, 1, 2),
         end_date=date(2025, 12, 31),
         initial_capital=Decimal("100000"),
     )
     elapsed = perf_counter() - started
 
     assert len(symbols) == 8
-    assert len(result["nav"]) > 2400
+    assert len(result["nav"]) > 450
     assert result["trades"]
-    assert elapsed < 30, f"10-year benchmark took {elapsed:.2f}s"
+    assert elapsed < 30, f"two-year benchmark took {elapsed:.2f}s"

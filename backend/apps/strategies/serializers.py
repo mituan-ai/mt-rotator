@@ -50,5 +50,5 @@ class SignalSerializer(serializers.ModelSerializer):
         return {
             "provider": obj.snapshot.provider,
             "cutoff_date": obj.snapshot.cutoff_date,
-            "adjustment": "hfq",
+            "adjustment": "dividend_adjusted_total_return",
         }

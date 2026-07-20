@@ -1,10 +1,10 @@
 import { LineChart } from 'echarts/charts'
 import { GridComponent, LegendComponent, TooltipComponent } from 'echarts/components'
-import { getInstanceByDom, init, use, type EChartsCoreOption } from 'echarts/core'
+import { getInstanceByDom, init, use as registerECharts, type EChartsCoreOption } from 'echarts/core'
 import { CanvasRenderer } from 'echarts/renderers'
 import { useEffect, useRef } from 'react'
 
-use([LineChart, GridComponent, LegendComponent, TooltipComponent, CanvasRenderer])
+registerECharts([LineChart, GridComponent, LegendComponent, TooltipComponent, CanvasRenderer])
 
 export function Chart({ option, height = 340 }: { option: EChartsCoreOption; height?: number }) {
     const element = useRef<HTMLDivElement>(null)

@@ -1,36 +1,47 @@
-# Repository Guidelines
+# 仓库规范
 
-## Product boundaries
+## 产品边界
 
-- MT Rotator is an invite-only, multi-user A-share ETF research and paper-trading application.
-- It never sends live broker orders and never presents end-of-day data as real-time.
-- Strategy code is administrator-maintained and versioned. Users cannot upload code or edit strategy parameters.
-- Do not add social feeds, avatars, leaderboards, manual trading, or public portfolio data.
+- MT Rotator 是仅限受邀用户使用的多用户 A 股 ETF 研究与模拟交易应用。
+- 禁止发送实盘委托，也不得把日终数据表述为实时行情。
+- 策略由管理员维护并版本化；用户不能上传代码或修改策略参数。
+- 策略只生成账户相关建议，不得替用户创建委托。
+- 每名用户只有一个不可重置的自主模拟账户；用户确认的委托只在下一交易日开盘批次成交。
+- 实名排行榜必须展示昵称和账户短号，不得展示邮箱或持仓。
+- 不得增加社交动态、头像、实时行情、券商接入或公开持仓功能。
+- 行情只能使用 AKShare 接入的新浪财经数据；不得增加备用数据源或逐行混用来源。
 
-## Structure
+## 目录职责
 
-- `backend/`: Django, DRF, Celery, market-data ingestion, strategy engine, backtests, and immutable paper ledger.
-- `frontend/`: Vite, React, TypeScript, authenticated application and integrated admin pages.
-- `infra/`: Caddy and operational scripts.
+- `backend/`：Django、DRF、Celery、行情采集、策略引擎、回测和不可变模拟账本。
+- `frontend/`：Vite、React、TypeScript、认证应用和集成管理页面。
+- `infra/`：Caddy 和运维脚本。
 
-## Development
+## 开发与验证
 
-- Backend: `cd backend && uv sync --all-groups && MT_TESTING=1 uv run pytest`.
-- Frontend: `cd frontend && npm ci && npm test && npm run build`.
-- Full stack: copy `.env.example` to `.env`, then run `docker compose up --build`.
-- Never commit `.env`, credentials, database files, market caches, or generated build output.
+- 常规完整检查：在仓库根目录运行 `make test`。
+- 后端单独检查：`cd backend && uv sync --all-groups && MT_TESTING=1 uv run pytest`。
+- 前端单独检查：`cd frontend && npm ci && npm run lint && npm run typecheck && npm test && npm run build`。
+- 涉及完整用户流程时，额外运行 `make e2e`。
+- 本地全栈启动：复制 `.env.example` 为 `.env`，再运行 `docker compose up --build`。
+- 不得提交 `.env`、凭据、数据库文件、行情缓存或生成的构建产物。
 
-## Correctness invariants
+## 正确性不变量
 
-- Signals may only read completed data at or before their signal date.
-- A close-derived signal may not fill before the next trading session.
-- Research uses back-adjusted data; fills use raw OHLC only.
-- Missing pre-listing data stays missing. Never backward-fill price history.
-- Orders, fills, ledger entries, strategy versions, and dataset snapshots are append-only.
+- 信号只能读取信号日期及之前已完成的数据。
+- 基于收盘价生成的信号不得早于下一交易日成交。
+- 研究使用分红调整后的总回报序列，成交只使用原始 OHLC。
+- 上市前缺失数据必须保持缺失，禁止向后填充价格历史。
+- 未知 ETF 交收属性默认 T+1；T+0 必须有版本化元数据或管理员覆盖。
+- 成交、持仓批次、账本条目、建议快照、策略版本和数据集快照只可追加。
+- 自主账户不得重启或清空历史；旧自动账户保持归档只读。
 
-## Style and verification
+## 设计与完成标准
 
-- Python uses Ruff formatting and explicit Decimal arithmetic for money.
-- TypeScript uses single quotes and no semicolons.
-- Add tests for every accounting, temporal, authentication, or data-readiness change.
-- Preserve user data and unrelated worktree changes. Never overwrite the archived project.
+- 修改跨领域流程、数据模型或异步任务前，先阅读 `docs/architecture.md`，确认受影响的领域归属和不变量。
+- 仅当新 helper、wrapper、service、配置项或抽象能够隐藏实质复杂度或消除重复领域推理时才可引入；禁止只做转发的中间层。
+- 重构必须限于当前任务。与正确性无关的更大架构问题应单独报告，不得顺手扩大修改范围。
+- 金额计算使用显式 `Decimal`；Python 遵循 Ruff，TypeScript 使用单引号且不加分号。
+- 会计、时序、认证或数据就绪性变更必须增加测试。
+- 完成代码修改后，检查 diff 是否存在领域边界泄漏、重复领域逻辑、无效抽象或未测试的失败路径，再运行与改动对应的检查。
+- 保留用户数据和工作区中的无关改动，禁止覆盖归档项目。

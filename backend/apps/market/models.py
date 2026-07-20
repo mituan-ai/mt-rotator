@@ -10,12 +10,47 @@ class Instrument(models.Model):
         SHANGHAI = "XSHG", "上海证券交易所"
         SHENZHEN = "XSHE", "深圳证券交易所"
 
+    class AssetClass(models.TextChoices):
+        EQUITY = "equity", "股票"
+        BOND = "bond", "债券"
+        MONEY = "money", "货币"
+        GOLD = "gold", "黄金"
+        CROSS_BORDER = "cross_border", "跨境"
+        COMMODITY = "commodity", "商品"
+        UNKNOWN = "unknown", "未分类"
+
+    class SettlementCycle(models.TextChoices):
+        T0 = "t0", "T+0"
+        T1 = "t1", "T+1"
+
+    class DataStatus(models.TextChoices):
+        READY = "ready", "正常"
+        STALE = "stale", "陈旧"
+        MISSING = "missing", "缺失"
+        BLOCKED = "blocked", "暂停"
+
     symbol = models.CharField(primary_key=True, max_length=6)
     name = models.CharField(max_length=80)
     exchange = models.CharField(max_length=4, choices=Exchange.choices)
     lot_size = models.PositiveIntegerField(default=100)
     listed_on = models.DateField(null=True, blank=True)
     enabled = models.BooleanField(default=True)
+    catalog_active = models.BooleanField(default=True, db_index=True)
+    asset_class = models.CharField(
+        max_length=16, choices=AssetClass.choices, default=AssetClass.UNKNOWN, db_index=True
+    )
+    settlement_cycle = models.CharField(
+        max_length=2, choices=SettlementCycle.choices, default=SettlementCycle.T1
+    )
+    data_status = models.CharField(
+        max_length=10, choices=DataStatus.choices, default=DataStatus.MISSING, db_index=True
+    )
+    data_error = models.TextField(blank=True)
+    last_bar_date = models.DateField(null=True, blank=True, db_index=True)
+    average_amount_20d = models.DecimalField(max_digits=24, decimal_places=2, default=0)
+    trade_eligible = models.BooleanField(default=False, db_index=True)
+    advice_eligible = models.BooleanField(default=False, db_index=True)
+    metadata = models.JSONField(default=dict, blank=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
@@ -33,7 +68,7 @@ class MarketDataBatch(models.Model):
         FAILED = "failed", "失败"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    provider = models.CharField(max_length=40, default="eastmoney-akshare")
+    provider = models.CharField(max_length=40, default="sina-akshare")
     status = models.CharField(max_length=12, choices=Status.choices, default=Status.RUNNING, db_index=True)
     expected_session = models.DateField(null=True, blank=True)
     row_count = models.PositiveIntegerField(default=0)
@@ -63,6 +98,7 @@ class MarketBar(models.Model):
     low = models.DecimalField(max_digits=18, decimal_places=6)
     close = models.DecimalField(max_digits=18, decimal_places=6)
     volume = models.DecimalField(max_digits=24, decimal_places=2)
+    amount = models.DecimalField(max_digits=24, decimal_places=2, default=0)
     is_current = models.BooleanField(default=True, db_index=True)
     created_at = models.DateTimeField(auto_now_add=True)
 

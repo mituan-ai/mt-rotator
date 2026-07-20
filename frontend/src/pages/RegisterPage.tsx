@@ -9,7 +9,7 @@ function tokenFromHash(): string {
 }
 
 export function RegisterPage() {
-    const token = useMemo(tokenFromHash, [])
+    const token = useMemo(() => tokenFromHash(), [])
     const navigate = useNavigate()
     const { refresh } = useAuth()
     const [email, setEmail] = useState('')

@@ -42,15 +42,21 @@ class DataFreshnessView(APIView):
 
     def get(self, request):
         from apps.market.services import current_data_status
+        from apps.paper.services import paper_cycle_status
 
         status_payload = current_data_status()
         last_batch = status_payload["last_batch"]
+        paper = paper_cycle_status(status_payload["expected_session"])
+        fresh = status_payload["ready"] and paper["status"] == "fresh"
         payload = {
-            "status": "fresh" if status_payload["ready"] else "stale",
+            "status": "fresh" if fresh else "stale",
             "expected_session": status_payload["expected_session"],
             "last_batch_status": last_batch["status"] if last_batch else None,
+            "paper_status": paper["status"],
+            "processed_through": paper["processed_through"],
+            "pending_sessions": paper["pending_sessions"],
         }
-        return Response(payload, status=200 if status_payload["ready"] else 503)
+        return Response(payload, status=200 if fresh else 503)
 
 
 class AuditListView(APIView):

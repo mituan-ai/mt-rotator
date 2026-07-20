@@ -28,27 +28,32 @@ def one_bar(trade_date: date, close: str) -> pd.DataFrame:
                 "low": value - Decimal("0.1"),
                 "close": value,
                 "volume": Decimal("1000000"),
+                "amount": Decimal("20000000"),
             }
         ]
     )
 
 
 @pytest.mark.django_db
-def test_readiness_requires_raw_and_hfq(monkeypatch):
+def test_reference_instrument_failure_blocks_new_snapshots_only(monkeypatch):
     expected = date(2025, 3, 31)
     monkeypatch.setattr("apps.market.services.latest_expected_session", lambda: expected)
-    batch = seed_ready_day(expected)
+    seed_ready_day(expected)
+    from apps.market.models import Instrument
+
+    reference = Instrument.objects.get(symbol="510300")
+    reference.data_status = Instrument.DataStatus.STALE
+    reference.trade_eligible = False
+    reference.advice_eligible = False
+    reference.save()
     MarketBar.objects.filter(
-        batch=batch,
         instrument_id="510300",
-        adjustment=MarketBar.Adjustment.BACK,
     ).delete()
 
     status = current_data_status()
     assert status["ready"] is False
     item = next(row for row in status["instruments"] if row["symbol"] == "510300")
-    assert item["raw_latest_date"] == expected
-    assert item["hfq_latest_date"] is None
+    assert item["state"] == "stale"
 
 
 @pytest.mark.django_db
@@ -86,9 +91,10 @@ def test_snapshot_keeps_bar_and_action_revisions_immutable(monkeypatch):
         value=Decimal("0.20000000"),
     )
 
-    raw, _ = load_snapshot_frames(snapshot)
+    raw, total_return = load_snapshot_frames(snapshot)
     actions = corporate_actions_for_snapshot(snapshot)
     assert Decimal(raw["close"].at[pd.Timestamp(expected), "510300"]) == Decimal("4.000000")
+    assert not total_return.empty
     assert actions[0].value == Decimal("0.10000000")
 
     revised = create_snapshot(expected)

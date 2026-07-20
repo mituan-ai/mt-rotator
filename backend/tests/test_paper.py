@@ -15,6 +15,7 @@ from apps.paper.models import (
     PaperAccount,
     PaperRebalance,
     Position,
+    PositionLot,
 )
 from apps.paper.services import apply_actions_for_date, process_rebalance
 from apps.strategies.services import seed_strategy_catalog
@@ -31,6 +32,15 @@ def test_daily_corporate_actions_are_idempotent_and_adjust_cost(user):
         instrument=instruments["510300"],
         shares=1000,
         average_cost=Decimal("4.000000"),
+    )
+    lot = PositionLot.objects.create(
+        account=account,
+        instrument=instruments["510300"],
+        acquired_on=date(2025, 3, 3),
+        available_on=date(2025, 3, 4),
+        quantity=1000,
+        remaining_shares=1000,
+        unit_cost=Decimal("4.000000"),
     )
     record_date = date(2025, 3, 20)
     payment_date = date(2025, 3, 28)
@@ -63,8 +73,12 @@ def test_daily_corporate_actions_are_idempotent_and_adjust_cost(user):
     apply_actions_for_date(account, split_date)
     apply_actions_for_date(account, split_date)
     position.refresh_from_db()
+    lot.refresh_from_db()
     assert position.shares == 2000
     assert position.average_cost == Decimal("2.000000")
+    assert lot.quantity == 2000
+    assert lot.remaining_shares == 2000
+    assert lot.unit_cost == Decimal("2.000000")
     assert LedgerEntry.objects.filter(account=account, kind=LedgerEntry.Kind.SPLIT).count() == 1
 
 

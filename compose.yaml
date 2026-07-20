@@ -1,6 +1,7 @@
 name: mt-rotator
 
 x-backend: &backend
+  image: mt-rotator-api:local
   build:
     context: ./backend
   env_file: .env
@@ -53,10 +54,21 @@ services:
     security_opt:
       - no-new-privileges:true
 
+  migrate:
+    <<: *backend
+    command:
+      [
+        "sh",
+        "-ec",
+        "python manage.py migrate --noinput && python manage.py seed_catalog",
+      ]
+    restart: "no"
+
   api:
     <<: *backend
-    environment:
-      RUN_STARTUP_TASKS: "true"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
     healthcheck:
       test:
         - CMD
@@ -79,8 +91,6 @@ services:
         "--loglevel=INFO",
         "--concurrency=2",
       ]
-    environment:
-      RUN_STARTUP_TASKS: "false"
     depends_on:
       api:
         condition: service_healthy
@@ -96,13 +106,12 @@ services:
         "--loglevel=INFO",
         "--schedule=/tmp/celerybeat-schedule",
       ]
-    environment:
-      RUN_STARTUP_TASKS: "false"
     depends_on:
       api:
         condition: service_healthy
 
   caddy:
+    image: mt-rotator-web:local
     build:
       context: .
       dockerfile: infra/Caddy.Dockerfile
@@ -120,14 +129,7 @@ services:
       api:
         condition: service_healthy
     healthcheck:
-      test:
-        [
-          "CMD",
-          "wget",
-          "--no-check-certificate",
-          "--spider",
-          "https://localhost/api/v1/health/live",
-        ]
+      test: ["CMD-SHELL", "wget --no-check-certificate --spider \"$${CADDY_HEALTH_URL:-https://localhost/api/v1/health/live}\""]
       interval: 30s
       timeout: 10s
       retries: 5

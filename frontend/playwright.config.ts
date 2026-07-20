@@ -2,6 +2,7 @@ import { defineConfig, devices } from '@playwright/test'
 
 process.env.NO_PROXY = [process.env.NO_PROXY, '127.0.0.1', 'localhost'].filter(Boolean).join(',')
 process.env.no_proxy = process.env.NO_PROXY
+const externalBaseUrl = process.env.E2E_BASE_URL
 
 export default defineConfig({
     testDir: './e2e',
@@ -9,10 +10,10 @@ export default defineConfig({
     retries: process.env.CI ? 2 : 0,
     reporter: process.env.CI ? 'github' : 'list',
     use: {
-        baseURL: 'http://127.0.0.1:4173',
+        baseURL: externalBaseUrl || 'http://127.0.0.1:4173',
         trace: 'on-first-retry'
     },
-    webServer: {
+    webServer: externalBaseUrl ? undefined : {
         command: 'npm run dev -- --host 127.0.0.1 --port 4173',
         url: 'http://127.0.0.1:4173',
         reuseExistingServer: !process.env.CI

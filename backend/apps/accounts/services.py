@@ -85,7 +85,12 @@ def register_with_invitation(
                 display_name=display_name.strip(),
             )
     except IntegrityError as exc:
-        raise ValidationError("该邮箱已经注册") from exc
+        if User.objects.filter(email=normalized).exists():
+            raise ValidationError("该邮箱已经注册") from exc
+        raise ValidationError("该显示名称已被使用") from exc
+    from apps.paper.services import ensure_manual_account
+
+    ensure_manual_account(user)
     now = timezone.now()
     invitation.used_at = now
     invitation.used_by = user

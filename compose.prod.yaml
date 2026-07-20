@@ -1,0 +1,11 @@
+services:
+  migrate:
+    image: ${API_IMAGE:?API_IMAGE must be an immutable GHCR digest}
+  api:
+    image: ${API_IMAGE:?API_IMAGE must be an immutable GHCR digest}
+  worker:
+    image: ${API_IMAGE:?API_IMAGE must be an immutable GHCR digest}
+  beat:
+    image: ${API_IMAGE:?API_IMAGE must be an immutable GHCR digest}
+  caddy:
+    image: ${WEB_IMAGE:?WEB_IMAGE must be an immutable GHCR digest}

@@ -5,7 +5,7 @@ from apps.strategies.services import seed_strategy_catalog
 
 
 class Command(BaseCommand):
-    help = "Seed the fixed v1 ETF universe and three immutable strategy versions"
+    help = "Seed the fallback ETF catalog and three immutable advice strategy versions"
 
     def handle(self, *args, **options):
         instruments = seed_instruments()

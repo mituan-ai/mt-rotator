@@ -50,6 +50,8 @@ INSTALLED_APPS = [
     "apps.backtests",
     "apps.paper",
 ]
+if env_bool("MT_MIGRATION_LINTING"):
+    INSTALLED_APPS.append("django_migration_linter")
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
@@ -85,11 +87,21 @@ DATABASES: dict[str, Any]
 if TESTING:
     DATABASES = {"default": {"ENGINE": "django.db.backends.sqlite3", "NAME": ":memory:"}}
 else:
+    database_url = os.getenv("DATABASE_URL")
     DATABASES = {
-        "default": dj_database_url.parse(
-            os.getenv("DATABASE_URL", "postgresql://mt_rotator:mt_rotator@localhost:5432/mt_rotator"),
-            conn_max_age=60,
-            conn_health_checks=True,
+        "default": (
+            dj_database_url.parse(database_url, conn_max_age=60, conn_health_checks=True)
+            if database_url
+            else {
+                "ENGINE": "django.db.backends.postgresql",
+                "NAME": os.getenv("POSTGRES_DB", "mt_rotator"),
+                "USER": os.getenv("POSTGRES_USER", "mt_rotator"),
+                "PASSWORD": os.getenv("POSTGRES_PASSWORD", ""),
+                "HOST": os.getenv("POSTGRES_HOST", "localhost"),
+                "PORT": os.getenv("POSTGRES_PORT", "5432"),
+                "CONN_MAX_AGE": 60,
+                "CONN_HEALTH_CHECKS": True,
+            }
         )
     }
 
@@ -148,6 +160,7 @@ REST_FRAMEWORK = {
         "admin_write": "30/min",
     },
     "NUM_PROXIES": 1,
+    "URL_FORMAT_OVERRIDE": None,
 }
 
 CACHES = {
@@ -183,4 +196,12 @@ CELERY_BEAT_SCHEDULE["market-monthly-deep-refresh"] = {
     "task": "apps.market.tasks.update_market_data",
     "schedule": crontab(hour=20, minute=30, day_of_month=1),
     "args": ["scheduler:monthly", True],
+}
+CELERY_BEAT_SCHEDULE["paper-reconcile"] = {
+    "task": "apps.paper.tasks.reconcile_paper_cycles",
+    "schedule": crontab(minute="*/5"),
+}
+CELERY_BEAT_SCHEDULE["backtest-recovery"] = {
+    "task": "apps.backtests.tasks.recover_backtest_runs",
+    "schedule": crontab(minute="*/5"),
 }

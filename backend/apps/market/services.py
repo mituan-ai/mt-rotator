@@ -2,19 +2,32 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
+from collections.abc import Iterable
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
 import pandas as pd
+from dateutil.relativedelta import relativedelta
 from django.db import transaction
-from django.db.models import Max
+from django.db.models import Min
 from django.utils import timezone
 
-from .calendar import latest_expected_session, sessions_in_range
+from .calendar import calendar, latest_expected_session
 from .models import CorporateAction, DatasetSnapshot, Instrument, MarketBar, MarketDataBatch
-from .providers import EastmoneyProvider, ProviderError, SinaValidator
+from .providers import CatalogRecord, CorporateActionRecord, ProviderError, SinaProvider
+from .settlement import SETTLEMENT_RULES_VERSION, settlement_cycle_for
 
+HISTORY_MONTHS = 24
+MIN_TRADE_BARS = 20
+MIN_ADVICE_BARS = 252
+MIN_AVERAGE_AMOUNT = Decimal("10000000")
+MIN_SIGNAL_COVERAGE = Decimal("0.95")
+REFERENCE_SYMBOL = "510300"
+
+# Kept only to seed a usable catalog before the first network import and to
+# preserve compatibility with existing snapshots. Runtime eligibility is dynamic.
 INSTRUMENT_SEED = {
     "510300": ("沪深300ETF华泰柏瑞", Instrument.Exchange.SHANGHAI),
     "510500": ("中证500ETF南方", Instrument.Exchange.SHANGHAI),
@@ -31,19 +44,55 @@ REQUIRED_SYMBOLS = tuple(INSTRUMENT_SEED)
 def seed_instruments() -> list[Instrument]:
     result = []
     for symbol, (name, exchange) in INSTRUMENT_SEED.items():
-        item, _ = Instrument.objects.update_or_create(
+        item, _ = Instrument.objects.get_or_create(
             symbol=symbol,
-            defaults={"name": name, "exchange": exchange, "lot_size": 100, "enabled": True},
+            defaults={
+                "name": name,
+                "exchange": exchange,
+                "lot_size": 100,
+                "enabled": True,
+                "settlement_cycle": settlement_cycle_for(symbol),
+            },
         )
         result.append(item)
     return result
 
 
-def _same_bar(current: MarketBar, row) -> bool:
+def _asset_class(name: str, symbol: str) -> str:
+    normalized = name.casefold()
+    if symbol.startswith("513") or any(
+        word in normalized for word in ["纳指", "恒生", "港股", "日经", "德国", "法国", "标普"]
+    ):
+        return Instrument.AssetClass.CROSS_BORDER
+    if "黄金" in normalized or symbol.startswith("518"):
+        return Instrument.AssetClass.GOLD
+    if any(word in normalized for word in ["豆粕", "有色", "能源化工", "商品", "原油"]):
+        return Instrument.AssetClass.COMMODITY
+    if any(word in normalized for word in ["货币", "现金", "添益", "保证金"]):
+        return Instrument.AssetClass.MONEY
+    if symbol.startswith("511") or any(
+        word in normalized for word in ["国债", "政金债", "信用债", "可转债", "公司债"]
+    ):
+        return Instrument.AssetClass.BOND
+    return Instrument.AssetClass.EQUITY
+
+
+def _quantized(field: str, value: Any) -> Decimal:
+    places = Decimal("0.000001") if field in {"open", "high", "low", "close"} else Decimal("0.01")
+    return Decimal(str(value)).quantize(places)
+
+
+def _same_bar(current: MarketBar, row: dict[str, Any]) -> bool:
     return all(
-        getattr(current, field)
-        == Decimal(str(row[field])).quantize(Decimal("0.000001" if field != "volume" else "0.01"))
-        for field in ["open", "high", "low", "close", "volume"]
+        getattr(current, field) == _quantized(field, row[field])
+        for field in [
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "amount",
+        ]
     )
 
 
@@ -52,16 +101,17 @@ def store_bars(
     *, instrument: Instrument, batch: MarketDataBatch, adjustment: str, frame: pd.DataFrame
 ) -> int:
     created = 0
+    records = frame.to_dict("records")
     existing = {
         item.trade_date: item
         for item in MarketBar.objects.select_for_update().filter(
             instrument=instrument,
             adjustment=adjustment,
-            trade_date__in=list(frame["trade_date"]),
+            trade_date__in=[row["trade_date"] for row in records],
             is_current=True,
         )
     }
-    for row in frame.to_dict("records"):
+    for row in records:
         current = existing.get(row["trade_date"])
         if current and _same_bar(current, row):
             continue
@@ -73,264 +123,333 @@ def store_bars(
             batch=batch,
             trade_date=row["trade_date"],
             adjustment=adjustment,
-            open=Decimal(str(row["open"])),
-            high=Decimal(str(row["high"])),
-            low=Decimal(str(row["low"])),
-            close=Decimal(str(row["close"])),
-            volume=Decimal(str(row["volume"])),
+            open=_quantized("open", row["open"]),
+            high=_quantized("high", row["high"]),
+            low=_quantized("low", row["low"]),
+            close=_quantized("close", row["close"]),
+            volume=_quantized("volume", row["volume"]),
+            amount=_quantized("amount", row["amount"]),
         )
         created += 1
     return created
 
 
-def _cross_validate(symbol: str, primary: pd.DataFrame, warnings: list[dict], errors: list[dict]) -> None:
+def _previous_session(value: date) -> date:
+    timestamp = pd.Timestamp(value)
     try:
-        secondary = SinaValidator().fetch_bars(symbol).tail(20)
-    except ProviderError as exc:
-        warnings.append({"symbol": symbol, "source": "sina", "message": str(exc)})
-        return
-    left = (
-        primary[["trade_date", "close"]]
-        .tail(20)
-        .merge(secondary[["trade_date", "close"]], on="trade_date", suffixes=("_primary", "_secondary"))
+        session = calendar().date_to_session(timestamp, direction="previous")
+    except ValueError:
+        return (timestamp - pd.offsets.BDay(1)).date()
+    if session.date() == value:
+        session = calendar().previous_session(session)
+    return session.date()
+
+
+@transaction.atomic
+def _store_actions(*, batch: MarketDataBatch, records: Iterable[CorporateActionRecord]) -> int:
+    created = 0
+    for record in records:
+        record_date = record.record_date or _previous_session(record.effective_date)
+        current = (
+            CorporateAction.objects.select_for_update()
+            .filter(
+                instrument_id=record.symbol,
+                kind=record.kind,
+                effective_date=record.effective_date,
+                is_current=True,
+            )
+            .first()
+        )
+        detail = {**record.detail, "record_date_estimated": record.record_date is None}
+        if current and all(
+            [
+                current.record_date == record_date,
+                current.payment_date == record.payment_date,
+                current.value == record.value,
+                current.source_detail == detail,
+            ]
+        ):
+            continue
+        if current:
+            current.is_current = False
+            current.save(update_fields=["is_current"])
+        CorporateAction.objects.create(
+            instrument_id=record.symbol,
+            batch=batch,
+            kind=record.kind,
+            record_date=record_date,
+            effective_date=record.effective_date,
+            payment_date=record.payment_date,
+            value=record.value,
+            source_detail=detail,
+        )
+        created += 1
+    return created
+
+
+def _catalog_frame(record: CatalogRecord, expected: date) -> pd.DataFrame:
+    return pd.DataFrame([{"trade_date": expected, **(record.bar or {})}])
+
+
+def _upsert_catalog(records: list[CatalogRecord]) -> dict[str, Instrument]:
+    symbols = {record.symbol for record in records}
+    Instrument.objects.filter(catalog_active=True).exclude(symbol__in=symbols).update(
+        catalog_active=False,
+        data_status=Instrument.DataStatus.STALE,
+        trade_eligible=False,
+        advice_eligible=False,
+        data_error="当前新浪ETF目录中不存在",
     )
-    if len(left) < 10:
-        warnings.append({"symbol": symbol, "source": "sina", "message": "重叠交易日不足10天"})
-        return
-    difference = ((left["close_primary"] - left["close_secondary"]).abs() / left["close_primary"]).max()
-    if float(difference) > 0.001:
-        errors.append(
-            {"symbol": symbol, "source": "cross_validation", "message": f"收盘价差异 {difference:.4%}"}
+    result: dict[str, Instrument] = {}
+    for record in records:
+        instrument, created = Instrument.objects.get_or_create(
+            symbol=record.symbol,
+            defaults={
+                "name": record.name,
+                "exchange": record.exchange,
+                "lot_size": 100,
+                "asset_class": _asset_class(record.name, record.symbol),
+                "settlement_cycle": settlement_cycle_for(record.symbol),
+            },
         )
+        instrument.name = record.name
+        instrument.exchange = record.exchange
+        instrument.catalog_active = True
+        instrument.asset_class = _asset_class(record.name, record.symbol)
+        if created or not instrument.metadata.get("settlement_override"):
+            instrument.settlement_cycle = settlement_cycle_for(record.symbol)
+        instrument.metadata = {
+            **instrument.metadata,
+            "catalog_source": SinaProvider.name,
+            "settlement_rules_version": SETTLEMENT_RULES_VERSION,
+        }
+        instrument.save(
+            update_fields=[
+                "name",
+                "exchange",
+                "catalog_active",
+                "asset_class",
+                "settlement_cycle",
+                "metadata",
+                "updated_at",
+            ]
+        )
+        result[record.symbol] = instrument
+    return result
 
 
-def _cross_validate_dividends(*, start: date, warnings: list[dict], errors: list[dict]) -> None:
-    validator = SinaValidator()
-    for symbol in REQUIRED_SYMBOLS:
-        try:
-            secondary = validator.fetch_dividends(symbol)
-        except ProviderError as exc:
-            warnings.append({"symbol": symbol, "source": "sina_dividend", "message": str(exc)})
-            continue
-        primary = CorporateAction.objects.filter(
-            instrument_id=symbol,
-            kind=CorporateAction.Kind.CASH_DIVIDEND,
+def _refresh_instrument_health(instrument: Instrument, expected: date, error: str = "") -> None:
+    bars = list(
+        MarketBar.objects.filter(
+            instrument=instrument,
+            adjustment=MarketBar.Adjustment.RAW,
             is_current=True,
-            effective_date__gte=start,
-        )
-        if secondary.empty:
-            if primary.exists():
-                warnings.append(
-                    {"symbol": symbol, "source": "sina_dividend", "message": "新浪无可用分红记录"}
-                )
-            continue
-        latest_date = secondary.iloc[-1]["date"]
-        baseline_rows = secondary.loc[secondary["date"] < start, "cumulative"]
-        baseline = Decimal(str(baseline_rows.iloc[-1])) if not baseline_rows.empty else Decimal("0")
-        secondary_total = Decimal(str(secondary.iloc[-1]["cumulative"])) - baseline
-        primary_total = sum(
-            (action.value for action in primary.filter(effective_date__lte=latest_date)),
-            Decimal("0"),
-        )
-        if abs(primary_total - secondary_total) > Decimal("0.000001"):
-            errors.append(
-                {
-                    "symbol": symbol,
-                    "source": "dividend_cross_validation",
-                    "message": f"累计分红不一致，主源 {primary_total}，校验源 {secondary_total}",
-                }
-            )
+        ).order_by("-trade_date")[:MIN_ADVICE_BARS]
+    )
+    count = MarketBar.objects.filter(
+        instrument=instrument,
+        adjustment=MarketBar.Adjustment.RAW,
+        is_current=True,
+    ).count()
+    latest = bars[0].trade_date if bars else None
+    recent = bars[:MIN_TRADE_BARS]
+    average_amount = (
+        sum((item.amount for item in recent), Decimal("0")) / len(recent) if recent else Decimal("0")
+    )
+    listed_on = (
+        MarketBar.objects.filter(
+            instrument=instrument,
+            adjustment=MarketBar.Adjustment.RAW,
+            is_current=True,
+        ).aggregate(value=Min("trade_date"))["value"]
+        or instrument.listed_on
+    )
+    metadata = dict(instrument.metadata)
+    chronological = list(reversed(bars))
+    for previous, current in zip(chronological, chronological[1:], strict=False):
+        ratio = current.close / previous.close if previous.close else Decimal("1")
+        has_split = CorporateAction.objects.filter(
+            instrument=instrument,
+            kind=CorporateAction.Kind.SPLIT,
+            effective_date=current.trade_date,
+            is_current=True,
+        ).exists()
+        if (ratio > Decimal("1.5") or ratio < Decimal("0.5")) and not has_split:
+            metadata["corporate_action_pending"] = True
+            error = error or f"{current.trade_date} 出现疑似份额折算价格跳变"
+            break
+    blocked = metadata.get("corporate_action_pending", False)
+    status = (
+        Instrument.DataStatus.BLOCKED
+        if blocked
+        else Instrument.DataStatus.READY
+        if latest == expected
+        else Instrument.DataStatus.STALE
+        if latest
+        else Instrument.DataStatus.MISSING
+    )
+    trade_eligible = bool(
+        instrument.enabled
+        and instrument.catalog_active
+        and status == Instrument.DataStatus.READY
+        and count >= MIN_TRADE_BARS
+        and average_amount >= MIN_AVERAGE_AMOUNT
+    )
+    instrument.listed_on = listed_on
+    instrument.last_bar_date = latest
+    instrument.average_amount_20d = average_amount.quantize(Decimal("0.01"))
+    instrument.data_status = status
+    instrument.data_error = error
+    instrument.trade_eligible = trade_eligible
+    instrument.advice_eligible = trade_eligible and count >= MIN_ADVICE_BARS
+    instrument.metadata = {**metadata, "valid_bar_count": count}
+    instrument.save(
+        update_fields=[
+            "listed_on",
+            "last_bar_date",
+            "average_amount_20d",
+            "data_status",
+            "data_error",
+            "trade_eligible",
+            "advice_eligible",
+            "metadata",
+            "updated_at",
+        ]
+    )
 
 
-def _validate_coverage(
-    symbol: str,
-    adjustment: str,
-    frame: pd.DataFrame,
-    expected: date,
-    errors: list[dict],
-) -> bool:
-    valid = True
-    actual = set(frame["trade_date"])
-    first = min(actual)
-    missing = sorted(set(sessions_in_range(first, expected)) - actual)
-    if missing:
-        valid = False
-        errors.append(
-            {
-                "symbol": symbol,
-                "adjustment": adjustment,
-                "message": f"缺少 {len(missing)} 个交易日，首个缺口 {missing[0]}",
-            }
-        )
-    if frame.iloc[-1]["trade_date"] != expected:
-        valid = False
-        errors.append(
-            {
-                "symbol": symbol,
-                "adjustment": adjustment,
-                "message": f"最新日期 {frame.iloc[-1]['trade_date']}，预期 {expected}",
-            }
-        )
-    if adjustment == MarketBar.Adjustment.BACK:
-        returns = frame["close"].pct_change(fill_method=None).abs()
-        abnormal = returns[returns > 0.5]
-        if not abnormal.empty:
-            valid = False
-            errors.append(
-                {
-                    "symbol": symbol,
-                    "adjustment": adjustment,
-                    "message": f"发现 {len(abnormal)} 个超过50%的后复权单日变动",
-                }
-            )
-    return valid
+def _history_start(expected: date, requested: date | None) -> date:
+    minimum = expected - relativedelta(months=HISTORY_MONTHS)
+    return max(minimum, requested) if requested else minimum
 
 
 def import_market_data(
     *,
     triggered_by: str = "scheduler",
-    start: date = date(2010, 1, 1),
+    start: date | None = None,
     full_refresh: bool = False,
 ) -> MarketDataBatch:
-    instruments = seed_instruments()
     expected = latest_expected_session()
-    batch = MarketDataBatch.objects.create(expected_session=expected, triggered_by=triggered_by)
+    batch = MarketDataBatch.objects.create(
+        expected_session=expected,
+        triggered_by=triggered_by,
+        provider=SinaProvider.name,
+    )
+    provider = SinaProvider()
     errors: list[dict] = []
     warnings: list[dict] = []
     row_count = 0
     revision_count = 0
-    successful_frames = 0
-    provider = EastmoneyProvider()
-    bars_backfilled = MarketDataBatch.objects.filter(
-        status=MarketDataBatch.Status.HEALTHY,
-        metadata__bars_backfilled=True,
-    ).exists()
-    fetch_start = start if full_refresh or not bars_backfilled else expected - timedelta(days=90)
-    bar_sync_ok = True
+    action_revision_count = 0
 
     try:
-        names = provider.fetch_instrument_names()
-        for instrument in instruments:
-            if instrument.symbol not in names:
-                errors.append({"symbol": instrument.symbol, "message": "ETF列表中不存在"})
-            elif names[instrument.symbol] != instrument.name:
-                instrument.name = names[instrument.symbol]
-                instrument.save(update_fields=["name", "updated_at"])
+        records = provider.fetch_catalog()
     except ProviderError as exc:
-        warnings.append({"source": "instrument_names", "message": str(exc)})
+        Instrument.objects.filter(catalog_active=True).update(
+            data_status=Instrument.DataStatus.STALE,
+            data_error=str(exc),
+            trade_eligible=False,
+            advice_eligible=False,
+        )
+        batch.status = MarketDataBatch.Status.FAILED
+        batch.errors = [{"source": "catalog", "message": str(exc)}]
+        batch.finished_at = timezone.now()
+        batch.save(update_fields=["status", "errors", "finished_at"])
+        return batch
 
-    for instrument in instruments:
-        frames: dict[str, pd.DataFrame] = {}
-        for adjustment in [MarketBar.Adjustment.RAW, MarketBar.Adjustment.BACK]:
-            try:
-                frame = provider.fetch_bars(instrument.symbol, fetch_start, expected, adjustment)
-                bar_sync_ok = (
-                    _validate_coverage(instrument.symbol, adjustment, frame, expected, errors) and bar_sync_ok
-                )
-                row_count += len(frame)
-                revision_count += store_bars(
-                    instrument=instrument, batch=batch, adjustment=adjustment, frame=frame
-                )
-                successful_frames += 1
-                frames[adjustment] = frame
-            except Exception as exc:
-                bar_sync_ok = False
-                errors.append({"symbol": instrument.symbol, "adjustment": adjustment, "message": str(exc)})
-        raw_frame = frames.get(MarketBar.Adjustment.RAW)
-        hfq_frame = frames.get(MarketBar.Adjustment.BACK)
-        if raw_frame is not None:
-            first_date = raw_frame.iloc[0]["trade_date"]
-            if instrument.listed_on != first_date and (fetch_start == start or instrument.listed_on is None):
-                instrument.listed_on = first_date
-                instrument.save(update_fields=["listed_on", "updated_at"])
-            error_count = len(errors)
-            _cross_validate(instrument.symbol, raw_frame, warnings, errors)
-            bar_sync_ok = bar_sync_ok and len(errors) == error_count
-        if (
-            raw_frame is not None
-            and hfq_frame is not None
-            and set(raw_frame["trade_date"]) != set(hfq_frame["trade_date"])
-        ):
-            bar_sync_ok = False
-            errors.append(
-                {
-                    "symbol": instrument.symbol,
-                    "source": "adjustment_alignment",
-                    "message": "不复权与后复权交易日期不一致",
-                }
+    instruments = _upsert_catalog(records)
+    history_start = _history_start(expected, start)
+    previous_session = _previous_session(expected)
+    request_interval = getattr(provider, "request_interval_seconds", 0)
+    for record in records:
+        instrument = instruments[record.symbol]
+        item_error = ""
+        if record.bar:
+            frame = _catalog_frame(record, expected)
+            row_count += 1
+            revision_count += store_bars(
+                instrument=instrument,
+                batch=batch,
+                adjustment=MarketBar.Adjustment.RAW,
+                frame=frame,
             )
+        else:
+            warnings.append({"symbol": record.symbol, "message": "目录中没有有效收盘行情"})
 
-    history_backfilled = MarketDataBatch.objects.filter(
-        status=MarketDataBatch.Status.HEALTHY,
-        metadata__corporate_actions_backfilled=True,
-    ).exists()
-    actions_checked = MarketDataBatch.objects.filter(
-        status=MarketDataBatch.Status.HEALTHY,
-        metadata__corporate_actions_checked_on=expected.isoformat(),
-    ).exists()
-    action_years = (
-        []
-        if actions_checked and not full_refresh
-        else list(range(start.year, expected.year + 1))
-        if full_refresh or not history_backfilled
-        else [expected.year]
-    )
-    action_sync_ok = True
-    for year in action_years:
-        try:
-            action_records = provider.fetch_corporate_actions(year, set(REQUIRED_SYMBOLS))
-            for record in action_records:
-                current = CorporateAction.objects.filter(
-                    instrument_id=record.symbol,
-                    kind=record.kind,
-                    effective_date=record.effective_date,
-                    is_current=True,
-                ).first()
-                if current and all(
-                    [
-                        current.record_date == record.record_date,
-                        current.payment_date == record.payment_date,
-                        current.value == record.value,
-                        current.source_detail == record.detail,
-                    ]
-                ):
-                    continue
-                if current:
-                    current.is_current = False
-                    current.save(update_fields=["is_current"])
-                CorporateAction.objects.create(
-                    instrument_id=record.symbol,
+        history_attempted = bool(instrument.metadata.get("history_backfilled"))
+        needs_history = bool(
+            full_refresh
+            or not history_attempted
+            or record.bar is None
+            or (instrument.last_bar_date and instrument.last_bar_date < previous_session)
+        )
+        metadata = dict(instrument.metadata)
+        if needs_history:
+            try:
+                history = provider.fetch_bars(record.symbol, history_start, expected)
+                row_count += len(history)
+                revision_count += store_bars(
+                    instrument=instrument,
                     batch=batch,
-                    kind=record.kind,
-                    record_date=record.record_date,
-                    effective_date=record.effective_date,
-                    payment_date=record.payment_date,
-                    value=record.value,
-                    source_detail=record.detail,
+                    adjustment=MarketBar.Adjustment.RAW,
+                    frame=history,
                 )
-        except ProviderError as exc:
-            action_sync_ok = False
-            errors.append({"source": "corporate_actions", "year": year, "message": str(exc)})
-    if action_sync_ok and action_years:
-        _cross_validate_dividends(start=start, warnings=warnings, errors=errors)
-    action_history_complete = bool(action_years) and action_years[0] == start.year
+                metadata.update(
+                    {
+                        "history_backfilled": True,
+                        "history_start": history_start.isoformat(),
+                        "history_checked_on": expected.isoformat(),
+                    }
+                )
+            except ProviderError as exc:
+                item_error = str(exc)
+                errors.append({"symbol": record.symbol, "message": item_error})
+            finally:
+                if request_interval:
+                    time.sleep(request_interval)
 
+        needs_actions = bool(
+            needs_history
+            or (instrument.trade_eligible and metadata.get("actions_checked_on") != expected.isoformat())
+        )
+        if needs_actions:
+            try:
+                action_revision_count += _store_actions(
+                    batch=batch,
+                    records=provider.fetch_dividends(record.symbol),
+                )
+                metadata["actions_checked_on"] = expected.isoformat()
+            except ProviderError as exc:
+                warnings.append({"symbol": record.symbol, "source": "dividends", "message": str(exc)})
+            finally:
+                if request_interval:
+                    time.sleep(request_interval)
+        if metadata != instrument.metadata:
+            instrument.metadata = metadata
+            instrument.save(update_fields=["metadata", "updated_at"])
+        _refresh_instrument_health(instrument, expected, item_error)
+
+    ready_count = Instrument.objects.filter(
+        catalog_active=True, data_status=Instrument.DataStatus.READY
+    ).count()
     batch.row_count = row_count
-    batch.errors = errors
-    batch.warnings = warnings
+    batch.errors = errors[:200]
+    batch.warnings = warnings[:200]
     batch.metadata = {
-        "bar_start": fetch_start.isoformat(),
-        "bars_backfilled": bars_backfilled or (fetch_start == start and bar_sync_ok),
+        "catalog_count": len(records),
+        "ready_count": ready_count,
+        "history_start": history_start.isoformat(),
+        "history_months": HISTORY_MONTHS,
         "revision_count": revision_count,
-        "corporate_action_years": action_years,
-        "corporate_actions_backfilled": history_backfilled or (action_sync_ok and action_history_complete),
-        "corporate_actions_checked_on": expected.isoformat() if action_sync_ok else None,
+        "corporate_action_revision_count": action_revision_count,
+        "error_count": len(errors),
+        "warning_count": len(warnings),
         "full_refresh": full_refresh,
     }
     batch.finished_at = timezone.now()
     batch.status = (
         MarketDataBatch.Status.FAILED
-        if successful_frames == 0
+        if ready_count == 0
         else MarketDataBatch.Status.DEGRADED
         if errors
         else MarketDataBatch.Status.HEALTHY
@@ -339,51 +458,183 @@ def import_market_data(
     return batch
 
 
+def repair_instrument_data(symbol: str, *, triggered_by: str) -> MarketDataBatch:
+    instrument = Instrument.objects.get(symbol=symbol, catalog_active=True)
+    expected = latest_expected_session()
+    batch = MarketDataBatch.objects.create(
+        expected_session=expected,
+        triggered_by=triggered_by,
+        provider=SinaProvider.name,
+    )
+    provider = SinaProvider()
+    try:
+        frame = provider.fetch_bars(symbol, _history_start(expected, None), expected)
+        revisions = store_bars(
+            instrument=instrument,
+            batch=batch,
+            adjustment=MarketBar.Adjustment.RAW,
+            frame=frame,
+        )
+        action_revisions = _store_actions(batch=batch, records=provider.fetch_dividends(symbol))
+        instrument.metadata = {**instrument.metadata, "history_backfilled": True}
+        instrument.save(update_fields=["metadata", "updated_at"])
+        _refresh_instrument_health(instrument, expected)
+        batch.status = MarketDataBatch.Status.HEALTHY
+        batch.row_count = len(frame)
+        batch.metadata = {
+            "symbol": symbol,
+            "revision_count": revisions,
+            "corporate_action_revision_count": action_revisions,
+        }
+    except ProviderError as exc:
+        _refresh_instrument_health(instrument, expected, str(exc))
+        batch.status = MarketDataBatch.Status.FAILED
+        batch.errors = [{"symbol": symbol, "message": str(exc)}]
+    batch.finished_at = timezone.now()
+    batch.save(update_fields=["status", "row_count", "errors", "metadata", "finished_at"])
+    return batch
+
+
+@transaction.atomic
+def update_instrument_controls(
+    instrument: Instrument,
+    *,
+    enabled: bool | None = None,
+    settlement_cycle: str | None = None,
+    asset_class: str | None = None,
+) -> Instrument:
+    instrument = Instrument.objects.select_for_update().get(pk=instrument.pk)
+    update_fields = ["updated_at"]
+    if enabled is not None:
+        instrument.enabled = enabled
+        update_fields.append("enabled")
+    if settlement_cycle is not None:
+        instrument.settlement_cycle = settlement_cycle
+        instrument.metadata = {
+            **instrument.metadata,
+            "settlement_override": True,
+            "settlement_rules_version": SETTLEMENT_RULES_VERSION,
+        }
+        update_fields.extend(["settlement_cycle", "metadata"])
+    if asset_class is not None:
+        instrument.asset_class = asset_class
+        update_fields.append("asset_class")
+    instrument.save(update_fields=list(dict.fromkeys(update_fields)))
+    _refresh_instrument_health(instrument, latest_expected_session(), instrument.data_error)
+    return instrument
+
+
+@transaction.atomic
+def record_manual_corporate_action(
+    instrument: Instrument,
+    *,
+    kind: str,
+    effective_date: date,
+    value: Decimal,
+    record_date: date | None = None,
+    payment_date: date | None = None,
+) -> CorporateAction:
+    batch = MarketDataBatch.objects.create(
+        provider="manual-admin",
+        status=MarketDataBatch.Status.HEALTHY,
+        expected_session=latest_expected_session(),
+        row_count=1,
+        metadata={"manual_corporate_action": True},
+        finished_at=timezone.now(),
+        triggered_by="admin",
+    )
+    current = (
+        CorporateAction.objects.select_for_update()
+        .filter(
+            instrument=instrument,
+            kind=kind,
+            effective_date=effective_date,
+            is_current=True,
+        )
+        .first()
+    )
+    if current:
+        current.is_current = False
+        current.save(update_fields=["is_current"])
+    action = CorporateAction.objects.create(
+        instrument=instrument,
+        batch=batch,
+        kind=kind,
+        record_date=record_date,
+        effective_date=effective_date,
+        payment_date=payment_date,
+        value=value,
+        source_detail={"source": "manual-admin"},
+    )
+    if kind == CorporateAction.Kind.SPLIT:
+        instrument.metadata = {**instrument.metadata, "corporate_action_pending": False}
+        instrument.save(update_fields=["metadata", "updated_at"])
+        _refresh_instrument_health(instrument, latest_expected_session())
+    return action
+
+
 def current_data_status() -> dict:
     expected = latest_expected_session()
-    rows = (
-        MarketBar.objects.filter(
-            batch__finished_at__isnull=False,
-            instrument_id__in=REQUIRED_SYMBOLS,
-        )
-        .values("instrument_id", "adjustment")
-        .annotate(latest=Max("trade_date"))
+    instruments = list(Instrument.objects.filter(catalog_active=True, enabled=True).order_by("symbol"))
+    batch_complete = market_session_import_complete(expected)
+
+    def effective_status(item: Instrument) -> str:
+        if item.data_status == Instrument.DataStatus.READY and (
+            item.last_bar_date != expected or not batch_complete
+        ):
+            return Instrument.DataStatus.STALE
+        return item.data_status
+
+    candidate = [
+        item
+        for item in instruments
+        if int(item.metadata.get("valid_bar_count", 0)) >= MIN_TRADE_BARS
+        and item.average_amount_20d >= MIN_AVERAGE_AMOUNT
+    ]
+    ready_candidates = [item for item in candidate if effective_status(item) == Instrument.DataStatus.READY]
+    coverage = Decimal(len(ready_candidates)) / len(candidate) if candidate else Decimal("0")
+    reference = next((item for item in instruments if item.symbol == REFERENCE_SYMBOL), None)
+    ready = bool(
+        reference
+        and effective_status(reference) == Instrument.DataStatus.READY
+        and candidate
+        and coverage >= MIN_SIGNAL_COVERAGE
     )
-    dates = {(row["instrument_id"], row["adjustment"]): row["latest"] for row in rows}
-    catalog = {item.symbol: item for item in Instrument.objects.filter(symbol__in=REQUIRED_SYMBOLS)}
-    instruments = []
-    ready = True
-    for symbol in sorted(REQUIRED_SYMBOLS):
-        item = catalog.get(symbol)
-        raw_latest = dates.get((symbol, MarketBar.Adjustment.RAW))
-        hfq_latest = dates.get((symbol, MarketBar.Adjustment.BACK))
-        available = [value for value in [raw_latest, hfq_latest] if value]
-        state = (
-            "ready"
-            if item and raw_latest == expected and hfq_latest == expected
-            else "stale"
-            if available
-            else "missing"
-        )
-        ready = ready and state == "ready"
-        instruments.append(
-            {
-                "symbol": symbol,
-                "name": item.name if item else INSTRUMENT_SEED[symbol][0],
-                "latest_date": min(available) if available else None,
-                "raw_latest_date": raw_latest,
-                "hfq_latest_date": hfq_latest,
-                "state": state,
-            }
-        )
+    counts = {
+        "catalog": len(instruments),
+        "trade_eligible": sum(
+            item.trade_eligible and effective_status(item) == Instrument.DataStatus.READY
+            for item in instruments
+        ),
+        "advice_eligible": sum(
+            item.advice_eligible and effective_status(item) == Instrument.DataStatus.READY
+            for item in instruments
+        ),
+        "ready": sum(effective_status(item) == Instrument.DataStatus.READY for item in instruments),
+        "stale": sum(effective_status(item) == Instrument.DataStatus.STALE for item in instruments),
+        "missing": sum(effective_status(item) == Instrument.DataStatus.MISSING for item in instruments),
+        "blocked": sum(effective_status(item) == Instrument.DataStatus.BLOCKED for item in instruments),
+    }
+    problematic = [
+        {
+            "symbol": item.symbol,
+            "name": item.name,
+            "latest_date": item.last_bar_date,
+            "state": effective_status(item),
+            "error": item.data_error,
+        }
+        for item in instruments
+        if effective_status(item) != Instrument.DataStatus.READY
+    ][:100]
     last_batch = MarketDataBatch.objects.exclude(status=MarketDataBatch.Status.RUNNING).first()
-    ready = ready and bool(last_batch and last_batch.status == MarketDataBatch.Status.HEALTHY)
     return {
         "ready": ready,
         "expected_session": expected,
-        "source": "东方财富，经 AKShare 获取",
-        "validation_source": "新浪财经",
-        "adjustments": ["raw", "hfq"],
+        "source": "新浪财经，经 AKShare 获取",
+        "validation_source": "内部字段、日期与覆盖率校验",
+        "adjustments": ["raw", "total_return"],
+        "coverage": str(coverage.quantize(Decimal("0.0001"))),
+        "counts": counts,
         "last_batch": {
             "id": last_batch.id,
             "status": last_batch.status,
@@ -393,44 +644,52 @@ def current_data_status() -> dict:
         }
         if last_batch
         else None,
-        "instruments": instruments,
+        "instruments": problematic,
     }
 
 
-def _bars_as_of(
-    *, adjustment: str, as_of: datetime, symbols: tuple[str, ...] = REQUIRED_SYMBOLS
-) -> pd.DataFrame:
+def market_session_import_complete(target: date) -> bool:
+    return MarketDataBatch.objects.filter(
+        expected_session__gte=target,
+        status__in=[MarketDataBatch.Status.HEALTHY, MarketDataBatch.Status.DEGRADED],
+        finished_at__isnull=False,
+        metadata__catalog_count__gt=0,
+    ).exists()
+
+
+def _bars_as_of(*, adjustment: str, as_of: datetime, symbols: Iterable[str]) -> pd.DataFrame:
     rows = (
         MarketBar.objects.filter(
             adjustment=adjustment,
-            instrument_id__in=symbols,
+            instrument_id__in=list(symbols),
             created_at__lte=as_of,
             batch__finished_at__lte=as_of,
         )
         .order_by("instrument_id", "trade_date", "created_at", "id")
-        .values("id", "instrument_id", "trade_date", "open", "high", "low", "close", "volume")
+        .values(
+            "id",
+            "instrument_id",
+            "trade_date",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "amount",
+        )
     )
     latest: dict[tuple[str, date], Any] = {}
-    for bar_row in rows:
-        latest[(bar_row["instrument_id"], bar_row["trade_date"])] = bar_row
+    for row in rows:
+        latest[(row["instrument_id"], row["trade_date"])] = row
     if not latest:
         return pd.DataFrame()
     records = list(latest.values())
-    if adjustment == MarketBar.Adjustment.BACK:
-        result = (
-            pd.DataFrame(records)
-            .pivot(index="trade_date", columns="instrument_id", values="close")
-            .sort_index()
-        )
-        result.index = pd.to_datetime(result.index)
-        return result
-    frames = {}
-    for field in ["open", "high", "low", "close", "volume"]:
-        frames[field] = (
-            pd.DataFrame(records)
-            .pivot(index="trade_date", columns="instrument_id", values=field)
-            .sort_index()
-        )
+    frames = {
+        field: pd.DataFrame(records)
+        .pivot(index="trade_date", columns="instrument_id", values=field)
+        .sort_index()
+        for field in ["open", "high", "low", "close", "volume", "amount"]
+    }
     result = pd.concat(frames, axis=1)
     result.index = pd.to_datetime(result.index)
     return result
@@ -441,11 +700,14 @@ def _snapshot_as_of(snapshot: DatasetSnapshot) -> datetime:
     return datetime.fromisoformat(value) if value else snapshot.created_at
 
 
-def _visible_revision_ids(*, as_of: datetime, cutoff: date) -> tuple[list[str], list[str]]:
+def _visible_revision_ids(
+    *, as_of: datetime, cutoff: date, symbols: list[str]
+) -> tuple[list[str], list[str]]:
     bar_rows = (
         MarketBar.objects.filter(
-            instrument_id__in=REQUIRED_SYMBOLS,
+            instrument_id__in=symbols,
             trade_date__lte=cutoff,
+            adjustment=MarketBar.Adjustment.RAW,
             created_at__lte=as_of,
             batch__finished_at__lte=as_of,
         )
@@ -457,7 +719,7 @@ def _visible_revision_ids(*, as_of: datetime, cutoff: date) -> tuple[list[str], 
         bars[(bar_row["instrument_id"], bar_row["trade_date"], bar_row["adjustment"])] = str(bar_row["id"])
     action_rows = (
         CorporateAction.objects.filter(
-            instrument_id__in=REQUIRED_SYMBOLS,
+            instrument_id__in=symbols,
             effective_date__lte=cutoff,
             created_at__lte=as_of,
             batch__finished_at__lte=as_of,
@@ -476,30 +738,44 @@ def _visible_revision_ids(*, as_of: datetime, cutoff: date) -> tuple[list[str], 
 def create_snapshot(cutoff_date: date | None = None) -> DatasetSnapshot:
     status = current_data_status()
     if not status["ready"]:
-        raise ValueError("行情未就绪，不能创建数据快照")
+        raise ValueError("主要ETF行情覆盖不足，不能创建新的策略快照")
     cutoff = min(cutoff_date or status["expected_session"], status["expected_session"])
+    symbols = list(
+        Instrument.objects.filter(advice_eligible=True, catalog_active=True, enabled=True)
+        .order_by("symbol")
+        .values_list("symbol", flat=True)
+    )
+    if REFERENCE_SYMBOL not in symbols:
+        symbols.append(REFERENCE_SYMBOL)
+        symbols.sort()
     as_of = timezone.now()
-    bar_ids, action_ids = _visible_revision_ids(as_of=as_of, cutoff=cutoff)
-    digest_hash = hashlib.sha256(
+    bar_ids, action_ids = _visible_revision_ids(as_of=as_of, cutoff=cutoff, symbols=symbols)
+    digest = hashlib.sha256(
         json.dumps(
             {
-                "provider": "eastmoney-akshare",
+                "provider": SinaProvider.name,
                 "cutoff": cutoff.isoformat(),
+                "symbols": symbols,
                 "bars": bar_ids,
                 "actions": action_ids,
+                "rules": SETTLEMENT_RULES_VERSION,
             },
             sort_keys=True,
             separators=(",", ":"),
         ).encode()
-    )
-    digest = digest_hash.hexdigest()
+    ).hexdigest()
     snapshot, _ = DatasetSnapshot.objects.get_or_create(
         digest=digest,
         defaults={
             "cutoff_date": cutoff,
-            "provider": "eastmoney-akshare",
+            "provider": SinaProvider.name,
             "metadata": {
-                "symbols": list(REQUIRED_SYMBOLS),
+                "symbols": symbols,
+                "universe": symbols,
+                "universe_rule": {
+                    "minimum_bars": MIN_ADVICE_BARS,
+                    "minimum_average_amount_20d": str(MIN_AVERAGE_AMOUNT),
+                },
                 "bar_count": len(bar_ids),
                 "corporate_action_count": len(action_ids),
                 "data_as_of": as_of.isoformat(),
@@ -509,14 +785,46 @@ def create_snapshot(cutoff_date: date | None = None) -> DatasetSnapshot:
     return snapshot
 
 
+def _total_return_frame(raw: pd.DataFrame, actions: list[CorporateAction]) -> pd.DataFrame:
+    if raw.empty:
+        return pd.DataFrame()
+    closes = raw["close"].astype(float)
+    result = pd.DataFrame(index=closes.index, columns=closes.columns, dtype=float)
+    action_map: dict[tuple[str, date], tuple[float, float]] = {}
+    for action in actions:
+        key = (action.instrument_id, action.effective_date)
+        dividend, split = action_map.get(key, (0.0, 1.0))
+        if action.kind == CorporateAction.Kind.CASH_DIVIDEND:
+            dividend += float(action.value)
+        elif action.kind == CorporateAction.Kind.SPLIT:
+            split *= float(action.value)
+        action_map[key] = (dividend, split)
+    for symbol in closes.columns:
+        series = closes[symbol].dropna()
+        if series.empty:
+            continue
+        returns = series.pct_change(fill_method=None)
+        for timestamp in series.index[1:]:
+            dividend, split = action_map.get((symbol, timestamp.date()), (0.0, 1.0))
+            previous = series.shift(1).loc[timestamp]
+            if previous and (dividend or split != 1.0):
+                returns.loc[timestamp] = (series.loc[timestamp] * split + dividend) / previous - 1
+        total_return = (1 + returns.fillna(0)).cumprod() * series.iloc[0]
+        result.loc[total_return.index, symbol] = total_return
+    return result
+
+
 def load_snapshot_frames(snapshot: DatasetSnapshot) -> tuple[pd.DataFrame, pd.DataFrame]:
     as_of = _snapshot_as_of(snapshot)
-    raw = _bars_as_of(adjustment=MarketBar.Adjustment.RAW, as_of=as_of)
-    hfq = _bars_as_of(adjustment=MarketBar.Adjustment.BACK, as_of=as_of)
+    symbols = snapshot.metadata.get("symbols") or list(
+        Instrument.objects.filter(advice_eligible=True).values_list("symbol", flat=True)
+    )
+    raw = _bars_as_of(adjustment=MarketBar.Adjustment.RAW, as_of=as_of, symbols=symbols)
     cutoff = pd.Timestamp(snapshot.cutoff_date)
     raw = raw.loc[raw.index <= cutoff]
-    hfq = hfq.loc[hfq.index <= cutoff]
-    return raw, hfq
+    actions = corporate_actions_for_snapshot(snapshot)
+    total_return = _total_return_frame(raw, actions)
+    return raw, total_return
 
 
 def corporate_actions_for_snapshot(
@@ -524,9 +832,10 @@ def corporate_actions_for_snapshot(
 ) -> list[CorporateAction]:
     cutoff = min(through or snapshot.cutoff_date, snapshot.cutoff_date)
     as_of = _snapshot_as_of(snapshot)
+    symbols = snapshot.metadata.get("symbols") or []
     rows = (
         CorporateAction.objects.filter(
-            instrument_id__in=REQUIRED_SYMBOLS,
+            instrument_id__in=symbols,
             effective_date__lte=cutoff,
             created_at__lte=as_of,
             batch__finished_at__lte=as_of,
@@ -541,24 +850,25 @@ def corporate_actions_for_snapshot(
 
 
 def current_corporate_actions_for_date(when: date) -> list[CorporateAction]:
+    return [action for action, _ in current_corporate_actions_between(when - timedelta(days=1), when)]
+
+
+def current_corporate_actions_between(after: date, through: date) -> list[tuple[CorporateAction, date]]:
     rows = (
-        CorporateAction.objects.filter(
-            instrument_id__in=REQUIRED_SYMBOLS,
-            batch__finished_at__isnull=False,
-        )
+        CorporateAction.objects.filter(batch__finished_at__isnull=False)
         .select_related("instrument")
         .order_by("instrument_id", "kind", "effective_date", "created_at", "id")
     )
     latest: dict[tuple[str, str, date], CorporateAction] = {}
     for action in rows:
         latest[(action.instrument_id, action.kind, action.effective_date)] = action
-    return [
-        action
-        for action in latest.values()
-        if (
-            action.kind == CorporateAction.Kind.CASH_DIVIDEND
-            and action.payment_date == when
-            or action.kind == CorporateAction.Kind.SPLIT
-            and action.effective_date == when
+    due = []
+    for action in latest.values():
+        event_date = (
+            action.payment_date
+            if action.kind == CorporateAction.Kind.CASH_DIVIDEND
+            else action.effective_date
         )
-    ]
+        if event_date and after < event_date <= through:
+            due.append((action, event_date))
+    return sorted(due, key=lambda item: (item[1], item[0].instrument_id, item[0].kind))
