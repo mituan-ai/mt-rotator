@@ -19,7 +19,9 @@ RUN apt-get update \
 WORKDIR /app
 COPY --from=builder --chown=mtrotator:mtrotator /app/.venv /app/.venv
 COPY --chown=mtrotator:mtrotator . /app
-RUN chmod 0755 /app/docker-entrypoint.sh
+RUN mkdir -p /app/staticfiles \
+    && chown mtrotator:mtrotator /app/staticfiles \
+    && chmod 0755 /app/docker-entrypoint.sh
 USER mtrotator
 EXPOSE 8000
 ENTRYPOINT ["/app/docker-entrypoint.sh"]
