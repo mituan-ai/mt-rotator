@@ -7,3 +7,6 @@ useDefault = true
 paths = [
   '''\.env\.example$''',
 ]
+regexes = [
+  '''Correct-Horse-Battery-Staple-2026''',
+]
