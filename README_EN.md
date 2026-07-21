@@ -199,12 +199,14 @@ For a domain such as `etf.example.com`, set at least these values in `.env`:
 ```env
 DJANGO_SECRET_KEY=a-random-secret-with-at-least-50-characters
 POSTGRES_PASSWORD=a-separate-strong-database-password
-DJANGO_ALLOWED_HOSTS=etf.example.com
+DJANGO_ALLOWED_HOSTS=etf.example.com,localhost,127.0.0.1
 DJANGO_CSRF_TRUSTED_ORIGINS=https://etf.example.com
 PUBLIC_BASE_URL=https://etf.example.com
 SITE_ADDRESS=etf.example.com
 CADDY_HEALTH_URL=https://etf.example.com/api/v1/health/live
 ```
+
+Keep `localhost,127.0.0.1`; the API container uses them for its internal health check, while public traffic still enters Caddy only through the production domain.
 
 Keep `DJANGO_DEBUG=false`, `DJANGO_SECURE_COOKIES=true`, and `DJANGO_SECURE_SSL_REDIRECT=true`.
 

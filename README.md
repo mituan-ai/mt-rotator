@@ -199,12 +199,14 @@ cp .env.example .env
 ```env
 DJANGO_SECRET_KEY=至少50位的随机密钥
 POSTGRES_PASSWORD=独立的强数据库密码
-DJANGO_ALLOWED_HOSTS=etf.example.com
+DJANGO_ALLOWED_HOSTS=etf.example.com,localhost,127.0.0.1
 DJANGO_CSRF_TRUSTED_ORIGINS=https://etf.example.com
 PUBLIC_BASE_URL=https://etf.example.com
 SITE_ADDRESS=etf.example.com
 CADDY_HEALTH_URL=https://etf.example.com/api/v1/health/live
 ```
+
+保留 `localhost,127.0.0.1`，API 容器的内部健康检查需要这两个主机名；公网请求仍只通过正式域名进入 Caddy。
 
 保持 `DJANGO_DEBUG=false`、`DJANGO_SECURE_COOKIES=true` 和 `DJANGO_SECURE_SSL_REDIRECT=true`。
 
